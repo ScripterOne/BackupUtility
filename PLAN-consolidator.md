@@ -218,9 +218,20 @@ lookup — are unlimited under WAL.
 | `archive_entries` | parent archive, inner path, size, **crc32**, sha256 when resolved |
 | `findings` | volume, path, kind, detail — every skip, denial, unreadable file |
 
-`volumes.serial` rather than drive letter: `E:` is not an identity. A drive that moves between
-machines, or comes back after a re-letter, must be recognised as the same drive or the whole drain
-state is nonsense.
+**Volume identity is the NTFS volume serial / volume GUID — NOT the drive letter, and NOT the
+disk serial.** Both of the obvious choices are wrong here, and the second one was in an earlier
+draft of this document:
+
+- `E:` is not an identity. Letters move.
+- **`Get-Disk`'s `SerialNumber` is not an identity either on this estate.** Measured 2026-09-20 on
+  LabZilla: ten USB disks report only **five** distinct serials, each appearing on two physically
+  different disks of different sizes — `10C000000519` on both a 20.01 TB and a 16.37 TB disk,
+  `50C000000519` on both a 20.01 TB and another 20.01 TB, and so on. They are the **ASMedia
+  bridge's canned per-bay IDs** (two 5-bay enclosures, positions 10C–50C), not the drives'. A
+  catalogue keyed on them would silently merge a personal drive with an arcade one.
+
+The NTFS volume serial lives on the platter, survives re-lettering, and travels with the disk into
+another machine or another enclosure. Cross-check with the GPT partition GUID.
 
 `files` rows **are** the sightings — the same content appearing in nine places is nine `files` rows
 pointing at one `contents` row. That is R4 (provenance) expressed as a schema rather than a promise.
@@ -302,6 +313,20 @@ at a time.
 ---
 
 ## 8. Rules
+
+**R8 — NO DRIVE IS FORMATTED, SCRATCHED OR REUSED ON RECOLLECTION. Only the catalogue
+authorises it.** A drive may be reused when the catalogue shows every file on it is accounted for
+(§4's retirement gate) — never because someone remembers what is on it.
+
+*Earned twice on 2026-09-20.* `/mnt/backup-data` on Hamzilla was reported as failing backups
+because of its NAME; it is an archive volume and the backups were fine and verified. And `E:` on
+LabZilla was described as "a failed arcade drive download we can scratch clean" — it holds
+`2025Tax`, `GitBackup`, `GitHub`, `MassiveBackup`, `CommodoreNow_Final` and `MUSIC` alongside the
+arcade material. Formatting on that recollection would have taken the tax records, and it would
+have been discovered in April.
+
+This is not a failure of memory. It is 16 TB across thirteen drives, which nobody holds in their
+head — **which is the entire reason the inventory comes before any decision.**
 
 **R1 — Idempotent.** Re-running any phase is a no-op on unchanged input. This is the original sin
 of the old tool and the single most important property of the new one.
