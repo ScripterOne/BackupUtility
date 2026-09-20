@@ -53,12 +53,15 @@ harvesting, and it is the reason this is not a 36 TB problem.
 | Copy engine | **Use ROBOCOPY where we can.** |
 | OS files | An **option to ignore** operating-system files. |
 | GUI | **Real GUI, web based.** |
+| Scope | **Personal data. Arcade-machine drives are OUT for now.** |
+| Database | **The tool owns its own.** A self-contained catalogue, not a table in someone else's server. |
 
-**Recorded risk on the archive ruling, accepted by the operator:** unpacking and deduping inner
-files breaks **ROM sets**. MAME and most emulators require one `.zip` per game containing exact
-member files and CRCs; a rebuilt or partially-deduped archive is not the same artifact. The
-mitigation is that **nothing is ever deleted by this program** (§6), so sealed originals survive
-until a separate, explicit decision is made about them. Flagged once here; not re-litigated.
+**The archive ruling's main risk is now out of scope.** Unpacking and deduping inner files breaks
+**ROM sets** — MAME and most emulators require one `.zip` per game with exact member files and
+CRCs. With the **arcade-machine drives excluded** (operator, 2026-09-20) that exposure largely
+disappears. It is kept on the record because ROM and disc-image archives turn up in personal
+storage too, and because the arcade drives come into scope eventually. The standing mitigation is
+R3: **this program never deletes anything.**
 
 **Space is gained by RETIRING DRIVES, not by recovering bytes in place.** *(Operator,
 2026-09-20: "we will gain space after we can delete a drive because its data has been deduped
@@ -163,7 +166,7 @@ Reuses the estate's stack rather than inventing one.
 
 | Piece | Choice | Why |
 | --- | --- | --- |
-| Catalogue | **Postgres on Ham** | millions of rows; already running, already backed up |
+| Catalogue | **The tool's own SQLite database** (WAL), owned by the web server process | see §6 — self-contained, portable, and kept out of the production estate |
 | GUI | **Next.js**, the dashboard stack | "real GUI, web based"; the patterns and auth already exist |
 | Scanner | **agent per machine** (Windows + Linux) reporting to the catalogue | the data spans both; Samba over 36 TB is the slow path |
 | Copy engine | **robocopy** on Windows, **rsync** on Linux | operator ruling; `tools/repo-backup/backup-to-ham.ps1` already proves the robocopy pattern here |
@@ -183,7 +186,61 @@ alarm; `backup-to-ham.ps1` already gets this right (`robocopy exit=1 (<8 is succ
 
 ---
 
-## 6. The phases
+## 6. The catalogue — the tool's own database
+
+*Operator, 2026-09-20: "I think our tool should have its own database to help us keep track of what
+will become a massive data inventory. It will also give us a fast lookup source."*
+
+An earlier draft of this plan put the catalogue in **Ham's production Postgres**. That was wrong
+twice over:
+
+1. **This indexes personal data.** It has no business living in the business estate's production
+   database, mixed in with the orchestrator's work orders and the SIEM's schemas.
+2. **It couples a standalone tool to a production service.** The catalogue would then need Ham to
+   be up to answer a question about a drive sitting on the desk.
+
+**SQLite, in WAL mode, one file, owned by the web server process.** It handles tens of millions of
+rows comfortably with the right indexes, it is backed up by copying one file, it travels with the
+tool, and it needs no administration.
+
+**Concurrency, which is the one real constraint:** SQLite is single-writer, and SQLite over SMB is
+a known way to corrupt a database. So **agents never touch the file.** Each scanning agent batches
+its findings and POSTs them to the web server, which is the only writer. Readers — the GUI, the
+lookup — are unlimited under WAL.
+
+### Shape
+
+| table | holds |
+| --- | --- |
+| `volumes` | machine, label, **serial**, size, filesystem, drain state |
+| `files` | volume, full path, size, mtime, quick hash, sha256, parent archive (nullable) |
+| `contents` | one row per unique sha256 — size, canonical file, where the pool copy landed |
+| `archive_entries` | parent archive, inner path, size, **crc32**, sha256 when resolved |
+| `findings` | volume, path, kind, detail — every skip, denial, unreadable file |
+
+`volumes.serial` rather than drive letter: `E:` is not an identity. A drive that moves between
+machines, or comes back after a re-letter, must be recognised as the same drive or the whole drain
+state is nonsense.
+
+`files` rows **are** the sightings — the same content appearing in nine places is nine `files` rows
+pointing at one `contents` row. That is R4 (provenance) expressed as a schema rather than a promise.
+
+### Fast lookup is a first-class feature, not a by-product
+
+The operator asked for it explicitly, and it is arguably the more durable value: **a searchable
+index of everything he owns, which outlives the consolidation.** SQLite **FTS5** over filenames and
+paths gives sub-second search across tens of millions of rows, including inside archives — "where
+is that spreadsheet" answered for a file sitting in a zip on a shelved drive.
+
+Indexes: `(size)` for phase 2 grouping, `(sha256)`, `(quick_hash)`, `(volume_id, path)`, plus the
+FTS5 virtual table.
+
+**The catalogue is the asset.** Even if consolidation stopped after phase 3, an estate-wide,
+searchable inventory with provenance would be worth having on its own.
+
+---
+
+## 7. The phases
 
 **All phases up to AGGREGATE are strictly read-only.** Only the aggregate phase writes, and only to the destination.
 
@@ -244,7 +301,7 @@ at a time.
 
 ---
 
-## 7. Rules
+## 8. Rules
 
 **R1 — Idempotent.** Re-running any phase is a no-op on unchanged input. This is the original sin
 of the old tool and the single most important property of the new one.
@@ -270,7 +327,7 @@ copy has been hash-verified at the destination.
 
 ---
 
-## 8. What gets reused
+## 9. What gets reused
 
 - **`filetypes2.psd1`** — the category taxonomy, unchanged.
 - **The robocopy pattern** from `ZillaAI/tools/repo-backup/backup-to-ham.ps1`: UNC not mapped
@@ -278,10 +335,10 @@ copy has been hash-verified at the destination.
 - **SHA-256** approach from `DeDuplicator.ps1`.
 - The Next.js dashboard stack, Postgres on Ham, the orchestrator, Playwright for verification.
 
-## 9. Order of work
+## 10. Order of work
 
 0. **Write-test the destination path** (§3). Everything else is built on it.
-1. Catalogue schema + the inventory agent. Read-only, harmless, and it turns "duplicates in
+1. **The catalogue and its schema**, plus the inventory agent. Read-only, harmless, and it turns "duplicates in
    hundreds of thousands of places" from a feeling into a number.
 2. Fingerprint tiering.
 3. Archive indexing.
