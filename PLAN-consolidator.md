@@ -350,3 +350,58 @@ copy has been hash-verified at the destination.
 
 Steps 1–3 produce value before a single file moves: **the inventory alone answers how bad it is,
 what it would recover, and which drive to empty first.**
+
+---
+
+## 11. The product path — what must not be foreclosed
+
+*Operator, 2026-09-20: "We can also eventually add this to ZillaOps when we get done, it will make
+people happy to have a powerful Data Tool."*
+
+Build it for one estate. But a handful of decisions are free now and a rewrite later, so take them
+now and then stop thinking about it.
+
+**Follow the ZillaCyber boundary.** The established pattern in this estate is a **separate app that
+consumes ZillaOps over the wire, never coupled into ZillaAI**. This tool is the same shape: its own
+repo, its own catalogue, its own GUI, surfaced *through* ZillaOps rather than absorbed into it.
+That is also what keeps a customer's file inventory out of ZillaOps' own database.
+
+**No hardcoded estate.** No machine names, drive letters or paths in code. Volumes are discovered
+and keyed on serial (§6); sources are configuration. The moment `E:` or `Hamzilla` appears in a
+source file, the product option is gone.
+
+**Keep storage behind a narrow interface.** SQLite is right for one estate and stays right for most
+SMB deployments. A customer with a 50-machine fleet will want Postgres. If every query goes through
+a small repository layer rather than raw SQL scattered through the app, that is an adapter, not a
+rewrite. **This is the single highest-leverage thing to get right at the start.**
+
+**The agent↔server contract gets authentication from day one.** For a personal LAN it is tempting
+to skip it. Retrofitting auth onto a protocol that never had it is how you end up with a scanning
+agent that will report anyone's filesystem to anyone who asks. A token on every batch POST costs
+an afternoon now.
+
+**The multi-tenant shape already exists** — one catalogue per deployment. That was chosen in §6 to
+keep personal data out of the production estate, and the same boundary is what isolates one
+customer from another. Do not collapse it later for convenience.
+
+### A licensing trap to settle BEFORE choosing archive libraries
+
+Archive-format support is where a shippable product and a personal tool part company:
+
+- **zip / tar / gzip / bzip2 / xz** — open formats, permissive libraries. No issue.
+- **7z** — 7-Zip is **LGPL**; fine to use, mind the linking terms.
+- **RAR** — **the unrar licence forbids using the source to create a RAR-compatible archiver, and
+  carries redistribution conditions.** It is routinely used in personal tools and is a genuine
+  question the moment money changes hands.
+
+The estate has already learned the general form of this once: *a code licence is not a
+training-reuse right.* Same lesson, different clause. **Decide RAR before writing the extractor**,
+not after a customer asks. A clean answer exists — shell out to the user's own installed WinRAR/7-Zip
+rather than linking a library — and it is much easier to design in than to retrofit.
+
+**Not yet:** billing, per-tenant RBAC, an installer, cloud storage targets. Those are product work
+and this is not a product yet. The list above is only the set of decisions that would be expensive
+to reverse.
+
+**OPSEC:** roadmap and product intent are stealth by default. This document lives in a private repo
+and the product angle is not published.
