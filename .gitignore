@@ -1,0 +1,4 @@
+
+# Consolidator: NDJSON inventories and the catalogue are data, not source.
+consolidator/build/
+consolidator/**/*.ndjson
