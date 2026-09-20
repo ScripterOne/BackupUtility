@@ -4,7 +4,7 @@
     Disk health and SMART diagnostics, USB-bridge aware, with machine-readable output.
 
 .DESCRIPTION
-    Part of the Consolidator. Answers "which of these drives should I not trust with my only
+    Part of ZillaDM. Answers "which of these drives should I not trust with my only
     copy of something" before any data is moved onto or off them.
 
     WHY THIS IS NOT THE OBVIOUS SCRIPT

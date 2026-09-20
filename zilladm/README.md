@@ -1,6 +1,6 @@
-# Consolidator
+# ZillaDM — data management
 
-See [`../PLAN-consolidator.md`](../PLAN-consolidator.md) for the full plan. This directory is the
+See [`../PLAN-ZillaDM.md`](../PLAN-ZillaDM.md) for the full plan. This directory is the
 build, starting with the piece needed before any data moves: **which drives can be trusted.**
 
 ## Disk health

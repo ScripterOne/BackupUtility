@@ -1,8 +1,8 @@
 /**
- * Consolidator — local web GUI.
+ * ZillaDM — local web GUI.
  *
- * Deliberately dependency-free Node. The Consolidator will grow a real catalogue and a real
- * front end (see ../../PLAN-consolidator.md), but the first thing the operator needs is to run
+ * Deliberately dependency-free Node. ZillaDM will grow a real catalogue and a real
+ * front end (see ../../PLAN-ZillaDM.md), but the first thing the operator needs is to run
  * the disk-health check from a browser and read the result. That does not justify a build step.
  *
  * Binds to 127.0.0.1 only. This reports the contents and health of local storage; it has no
@@ -14,10 +14,11 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import * as cat from "./catalogue.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = join(HERE, "..", "scripts", "Get-DiskHealth.ps1");
-const PORT = Number(process.env.CONSOLIDATOR_PORT || 7420);
+const PORT = Number(process.env.ZILLADM_PORT || 7420);
 
 /** Run the health script and return its JSON. Never throws; failures come back as data. */
 function diskHealth() {
@@ -53,7 +54,32 @@ function diskHealth() {
   });
 }
 
+const json = (res, body, code = 200) => {
+  res.writeHead(code, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(JSON.stringify(body));
+};
+
 createServer(async (req, res) => {
+  const url = new URL(req.url, "http://127.0.0.1");
+
+  // --- catalogue ------------------------------------------------------------------------
+  if (url.pathname === "/api/volumes") {
+    try { return json(res, { volumes: cat.volumes(), db: cat.DB_PATH }); }
+    catch (e) { return json(res, { error: e.message, volumes: [] }, 500); }
+  }
+  if (url.pathname === "/api/folders") {
+    const id = Number(url.searchParams.get("volume"));
+    if (!id) return json(res, { error: "volume required", folders: [] }, 400);
+    try { return json(res, { folders: cat.topFolders(id) }); }
+    catch (e) { return json(res, { error: e.message, folders: [] }, 500); }
+  }
+  if (url.pathname === "/api/search") {
+    const q = (url.searchParams.get("q") || "").trim();
+    if (!q) return json(res, { hits: [] });
+    try { return json(res, { hits: cat.search(q) }); }
+    catch (e) { return json(res, { error: e.message, hits: [] }, 500); }
+  }
+
   if (req.url === "/api/disk-health") {
     const body = JSON.stringify(await diskHealth());
     res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
@@ -67,7 +93,7 @@ createServer(async (req, res) => {
   res.writeHead(404, { "content-type": "text/plain" });
   res.end("not found");
 }).listen(PORT, "127.0.0.1", () => {
-  console.log(`Consolidator GUI  ->  http://127.0.0.1:${PORT}`);
+  console.log(`ZillaDM GUI  ->  http://127.0.0.1:${PORT}`);
   console.log(`script: ${SCRIPT}`);
   console.log(`NOTE: start this from an ADMINISTRATOR shell or SMART cannot be read.`);
 });

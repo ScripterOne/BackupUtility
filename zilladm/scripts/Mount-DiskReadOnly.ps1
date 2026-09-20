@@ -6,7 +6,7 @@
     with no possibility of writing to it. Reversible.
 
 .DESCRIPTION
-    Part of the Consolidator. Before a drive is drained, retired or trusted, you have to see
+    Part of ZillaDM. Before a drive is drained, retired or trusted, you have to see
     what is on it — and some of the drives in this estate are repair candidates. This mounts
     them in the safest state Windows offers.
 

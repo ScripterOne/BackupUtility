@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZillaDM</title>
+<style>
+  :root{
+    --bg:#0f1115; --card:#161a21; --line:#252b35; --text:#e6e9ef; --dim:#8b94a3;
+    --ok:#34d399; --warn:#fbbf24; --bad:#f87171; --unknown:#a78bfa; --accent:#38bdf8;
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#f6f7f9; --card:#fff; --line:#e3e6ea; --text:#131720; --dim:#5b6472;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+       padding:22px 16px 72px}
+  .wrap{max-width:1120px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 2px;letter-spacing:-.01em}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+  .tabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:18px;flex-wrap:wrap}
+  .tab{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);
+       padding:8px 12px;cursor:pointer;font-size:14px;font-weight:550}
+  .tab[aria-selected="true"]{color:var(--text);border-bottom-color:var(--accent)}
+  button.go{background:var(--accent);color:#04121c;border:0;border-radius:8px;
+            padding:9px 16px;font-weight:650;cursor:pointer;font-size:14px}
+  button.go[disabled]{opacity:.5;cursor:default}
+  input[type=search]{background:var(--card);border:1px solid var(--line);color:var(--text);
+        border-radius:8px;padding:9px 12px;font-size:14px;width:100%;max-width:460px}
+  .meta{color:var(--dim);font-size:12px;margin:12px 0 16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+        padding:13px 15px;margin-bottom:9px}
+  .card.clk{cursor:pointer}
+  .card.clk:hover{border-color:var(--accent)}
+  .row{display:flex;align-items:center;gap:11px;flex-wrap:wrap}
+  .chip{font-size:10.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+        padding:3px 8px;border-radius:6px;white-space:nowrap}
+  .OK{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}
+  .ATTENTION{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+  .FAILING{background:color-mix(in srgb,var(--bad) 20%,transparent);color:var(--bad)}
+  .UNKNOWN{background:color-mix(in srgb,var(--unknown) 18%,transparent);color:var(--unknown)}
+  .state{background:color-mix(in srgb,var(--accent) 15%,transparent);color:var(--accent)}
+  .name{font-weight:640}
+  .dim{color:var(--dim);font-size:13px}
+  .attrs{margin-top:8px;display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--dim)}
+  .attrs b{color:var(--text);font-weight:600}
+  .finding{margin-top:7px;color:var(--bad);font-size:13px}
+  .note{margin-top:7px;color:var(--dim);font-size:12.5px}
+  .err{border-color:var(--bad)}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th{text-align:left;color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;
+     letter-spacing:.03em;padding:6px 10px;border-bottom:1px solid var(--line)}
+  td{padding:6px 10px;border-bottom:1px solid var(--line)}
+  td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .bar{height:4px;border-radius:3px;background:var(--accent);min-width:2px}
+  .legend{margin-top:24px;color:var(--dim);font-size:12.5px;line-height:1.7}
+  code{background:var(--card);border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:12px}
+  .empty{color:var(--dim);font-size:13.5px;padding:10px 2px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ZillaDM</h1>
+  <div class="sub">Data management — inventory, deduplicate, consolidate, retire.</div>
+
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" data-tab="drives" aria-selected="true">Drives</button>
+    <button class="tab" role="tab" data-tab="search" aria-selected="false">Search</button>
+    <button class="tab" role="tab" data-tab="health" aria-selected="false">Disk health</button>
+  </div>
+
+  <section id="p-drives">
+    <button class="go" id="reload">Refresh</button>
+    <div class="meta" id="m-drives"></div>
+    <div id="o-drives"></div>
+  </section>
+
+  <section id="p-search" hidden>
+    <input type="search" id="q" placeholder="Filename or path — searches inside the whole catalogue">
+    <div class="meta" id="m-search"></div>
+    <div id="o-search"></div>
+  </section>
+
+  <section id="p-health" hidden>
+    <button class="go" id="scan">Scan drives</button>
+    <div class="meta" id="m-health"></div>
+    <div id="o-health"></div>
+  </section>
+
+  <div class="legend" id="legend"></div>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const bytes = (n) => {
+  n = Number(n || 0);
+  if (n >= 1024**4) return (n/1024**4).toFixed(2) + " TB";
+  if (n >= 1024**3) return (n/1024**3).toFixed(1) + " GB";
+  if (n >= 1024**2) return (n/1024**2).toFixed(1) + " MB";
+  return n.toLocaleString() + " B";
+};
+const num = (n) => Number(n || 0).toLocaleString();
+
+const LEGEND = {
+  drives: `<b>Nothing here is deleted, ever.</b> Inventory is read-only; a drive becomes
+     <i>retirable</i> only when every file on it is verified present elsewhere — 100%, not 99%.
+     Volumes are keyed on the <b>NTFS volume serial</b>, not the letter and not the disk serial:
+     ten USB disks here report only five distinct disk serials, because the bridges report
+     themselves rather than the drives.`,
+  search: `Searches the catalogue, not the disks — so a file on a drive that is powered off,
+     shelved or offline still answers. That is the point of keeping the index.`,
+  health: `<b>UNKNOWN is not OK.</b> Most large drives here sit behind a USB-SATA bridge, and both
+     usual SMART paths return <i>nothing</i> rather than an error on USB — which reads like good
+     news. <b>UDMA CRC errors mean the cable or bridge</b>, not the platter.`,
+};
+
+// ---------------------------------------------------------------- drives
+async function loadDrives(){
+  const btn = $("#reload"); btn.disabled = true; btn.textContent = "Loading…";
+  try{
+    const r = await fetch("/api/volumes", {cache:"no-store"});
+    const d = await r.json();
+    const vols = d.volumes || [];
+    if (d.error) $("#o-drives").innerHTML = `<div class="card err"><b>${esc(d.error)}</b></div>`;
+    if (!vols.length){
+      $("#o-drives").innerHTML = `<div class="empty">No volumes inventoried yet. Run
+        <code>Invoke-Inventory.ps1 -DriveLetter E</code> then <code>node ingest.mjs &lt;file&gt;</code>.</div>`;
+    } else {
+      const max = Math.max(...vols.map(v => Number(v.bytes||0)), 1);
+      $("#o-drives").innerHTML = vols.map(v => `
+        <div class="card clk" data-vol="${v.id}">
+          <div class="row">
+            <span class="chip state">${esc(v.state)}</span>
+            <span class="name">${esc(v.drive_letter || "(no letter)")}</span>
+            <span class="dim">${esc(v.label || "")}</span>
+            <span class="dim">${esc(v.bus_type||"?")} · disk ${esc(v.disk_number)} · ${bytes(v.size_bytes)}</span>
+          </div>
+          <div class="attrs">
+            <span>${num(v.file_count)} <b>files</b></span>
+            <span>${bytes(v.bytes)} <b>catalogued</b></span>
+            <span>${num(v.finding_count)} <b>findings</b></span>
+            <span>vol serial <b>${esc(v.volume_serial)}</b></span>
+          </div>
+          <div class="bar" style="width:${Math.max(2, 100*Number(v.bytes||0)/max)}%;margin-top:9px"></div>
+          <div class="note" id="f-${v.id}"></div>
+        </div>`).join("");
+    }
+    $("#m-drives").textContent = `${vols.length} volume(s) · ${d.db || ""}`;
+  } catch(e){
+    $("#o-drives").innerHTML = `<div class="card err"><b>${esc(e.message)}</b></div>`;
+  } finally { btn.disabled = false; btn.textContent = "Refresh"; }
+}
+
+// Click a drive to see where its bytes actually sit — the "I thought that was scratch" answer.
+$("#o-drives").addEventListener("click", async (ev) => {
+  const card = ev.target.closest("[data-vol]"); if (!card) return;
+  const id = card.dataset.vol, slot = $(`#f-${id}`);
+  if (slot.dataset.open === "1"){ slot.innerHTML = ""; slot.dataset.open = "0"; return; }
+  slot.textContent = "loading folders…";
+  const d = await (await fetch(`/api/folders?volume=${id}`, {cache:"no-store"})).json();
+  const f = d.folders || [];
+  slot.dataset.open = "1";
+  slot.innerHTML = f.length ? `<table><thead><tr><th>Top-level folder</th><th class="num">Files</th>
+      <th class="num">Size</th></tr></thead><tbody>${f.map(x =>
+      `<tr><td>${esc(x.folder)}</td><td class="num">${num(x.files)}</td>
+       <td class="num">${bytes(x.bytes)}</td></tr>`).join("")}</tbody></table>`
+    : `<span class="dim">no folder data</span>`;
+});
+
+// ---------------------------------------------------------------- search
+let timer = null;
+$("#q").addEventListener("input", (e) => {
+  clearTimeout(timer);
+  const q = e.target.value.trim();
+  timer = setTimeout(async () => {
+    if (!q){ $("#o-search").innerHTML = ""; $("#m-search").textContent = ""; return; }
+    const d = await (await fetch(`/api/search?q=${encodeURIComponent(q)}`, {cache:"no-store"})).json();
+    const hits = d.hits || [];
+    $("#m-search").textContent = d.error ? d.error : `${hits.length} hit(s)`;
+    $("#o-search").innerHTML = hits.length ? `<table><thead><tr><th>Name</th><th>Where</th>
+        <th class="num">Size</th></tr></thead><tbody>${hits.map(h =>
+        `<tr><td>${esc(h.name)}</td>
+         <td class="dim">${esc(h.drive_letter||"")} ${esc(h.label||"")} \\ ${esc(h.path)}</td>
+         <td class="num">${bytes(h.size_bytes)}</td></tr>`).join("")}</tbody></table>`
+      : `<div class="empty">nothing found</div>`;
+  }, 220);
+});
+
+// ---------------------------------------------------------------- health
+function healthCard(d){
+  const letters = (d.drive_letters || []).join(" ") || "(no letter)";
+  const a = d.smart?.attributes || {};
+  const attrs = Object.keys(a).map(k => `<span>${esc(k)} <b>${esc(a[k])}</b></span>`).join("");
+  const findings = (d.smart?.findings || []).map(f => `<div class="finding">! ${esc(f)}</div>`).join("");
+  const note = d.smart?.available
+    ? `<div class="note">SMART via <code>-d ${esc(d.smart.device_type)}</code> · ${esc(d.smart.smart_status)}</div>`
+    : `<div class="note">SMART not read — ${esc(d.smart?.detail || "no detail")}</div>`;
+  return `<div class="card"><div class="row">
+      <span class="chip ${esc(d.verdict)}">${esc(d.verdict)}</span>
+      <span class="name">${esc(letters)}</span>
+      <span class="dim">disk ${esc(d.disk_number)} · ${esc(d.bus_type)} · ${esc(d.size_tb)} TB</span>
+      <span class="dim">${esc(d.friendly_name)}</span>
+    </div>${attrs?`<div class="attrs">${attrs}</div>`:""}${findings}${note}</div>`;
+}
+$("#scan").addEventListener("click", async () => {
+  const b = $("#scan"); b.disabled = true; b.textContent = "Scanning…";
+  $("#o-health").innerHTML = ""; $("#m-health").textContent = "";
+  try{
+    const d = await (await fetch("/api/disk-health", {cache:"no-store"})).json();
+    if (d.error) $("#o-health").innerHTML = `<div class="card err"><b>${esc(d.error)}</b>
+      <div class="note">${esc(d.stderr||"")}</div></div>`;
+    const order = { FAILING:0, ATTENTION:1, UNKNOWN:2, OK:3 };
+    const disks = (d.disks||[]).sort((x,y)=>(order[x.verdict]??9)-(order[y.verdict]??9));
+    $("#o-health").innerHTML += disks.map(healthCard).join("");
+    $("#m-health").textContent = [
+      d.machine, d.administrator ? "administrator" : "NOT administrator — SMART not attempted",
+      d.smartctl ? `smartctl: ${d.smartctl}` : "smartctl NOT INSTALLED",
+    ].filter(Boolean).join("  ·  ");
+  } catch(e){
+    $("#o-health").innerHTML = `<div class="card err"><b>${esc(e.message)}</b></div>`;
+  } finally { b.disabled = false; b.textContent = "Scan drives"; }
+});
+
+// ---------------------------------------------------------------- tabs
+document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach(x => x.setAttribute("aria-selected", String(x === t)));
+  for (const n of ["drives","search","health"]) $(`#p-${n}`).hidden = (n !== t.dataset.tab);
+  $("#legend").innerHTML = LEGEND[t.dataset.tab];
+}));
+$("#legend").innerHTML = LEGEND.drives;
+$("#reload").addEventListener("click", loadDrives);
+loadDrives();
+</script>
+</body>
+</html>

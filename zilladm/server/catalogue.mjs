@@ -1,7 +1,7 @@
 /**
- * Consolidator catalogue — schema and ingest.
+ * ZillaDM catalogue — schema and ingest.
  *
- * SQLite in WAL mode, one file, owned by this process. See ../../PLAN-consolidator.md §6.
+ * SQLite in WAL mode, one file, owned by this process. See ../../PLAN-ZillaDM.md §6.
  *
  * WHY THE SERVER IS THE ONLY WRITER
  * SQLite is single-writer, and SQLite over SMB is a known way to corrupt a database. Scanners
@@ -10,7 +10,7 @@
  *
  * WHY THE DATABASE LIVES OUTSIDE THE REPO
  * It will reach several GB. A catalogue committed to git by accident is worse than no catalogue.
- * Default P:\consolidator-data (NVMe, internal) — never a USB volume, whose sustained writes
+ * Default P:\zilladm-data (NVMe, internal) — never a USB volume, whose sustained writes
  * fail on this estate, and never a volume that is itself queued for consolidation.
  */
 import { DatabaseSync } from "node:sqlite";
@@ -18,7 +18,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 export const DB_PATH =
-  process.env.CONSOLIDATOR_DB || "P:\\consolidator-data\\catalogue.db";
+  process.env.ZILLADM_DB || "P:\\zilladm-data\\catalogue.db";
 
 const SCHEMA = `
 PRAGMA journal_mode = WAL;

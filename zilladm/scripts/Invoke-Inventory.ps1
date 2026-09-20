@@ -4,7 +4,7 @@
     Read-only inventory of a volume. Emits NDJSON for the catalogue. No hashing, no decisions.
 
 .DESCRIPTION
-    Phase 1 of the Consolidator (see ../../PLAN-consolidator.md §7). Walks a volume and records
+    Phase 1 of ZillaDM (see ../../PLAN-ZillaDM.md §7). Walks a volume and records
     path, size, mtime and attributes for every file. It cannot modify anything.
 
     TWO THINGS THAT MAKE THIS FAST
