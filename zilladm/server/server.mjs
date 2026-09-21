@@ -65,7 +65,13 @@ createServer(async (req, res) => {
 
   // --- catalogue ------------------------------------------------------------------------
   if (url.pathname === "/api/volumes") {
-    try { return json(res, { volumes: cat.volumes(), db: cat.DB_PATH }); }
+    try {
+      const health = Object.fromEntries(cat.readHealth().map((h) => [h.id, h]));
+      return json(res, {
+        volumes: cat.volumes().map((v) => ({ ...v, health: health[v.id] || null })),
+        db: cat.DB_PATH,
+      });
+    }
     catch (e) { return json(res, { error: e.message, volumes: [] }, 500); }
   }
   if (url.pathname === "/api/folders") {

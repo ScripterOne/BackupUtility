@@ -45,6 +45,10 @@
   .FAILING{background:color-mix(in srgb,var(--bad) 20%,transparent);color:var(--bad)}
   .UNKNOWN{background:color-mix(in srgb,var(--unknown) 18%,transparent);color:var(--unknown)}
   .state{background:color-mix(in srgb,var(--accent) 15%,transparent);color:var(--accent)}
+  .clean{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}
+  .flaky{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+  .failing{background:color-mix(in srgb,var(--bad) 20%,transparent);color:var(--bad)}
+  .unread{background:color-mix(in srgb,var(--unknown) 18%,transparent);color:var(--unknown)}
   .name{font-weight:640}
   .dim{color:var(--dim);font-size:13px}
   .attrs{margin-top:8px;display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--dim)}
@@ -143,7 +147,12 @@ const bytes = (n) => {
 const num = (n) => Number(n || 0).toLocaleString();
 
 const LEGEND = {
-  drives: `<b>Nothing here is deleted, ever.</b> Inventory is read-only; a drive becomes
+  drives: `<b>READ HEALTH is what happened when we actually read the drive</b> — not what SMART
+     believes, and it needs no administrator rights. Windows called every drive here <i>Healthy</i>
+     while E: threw an I/O device error mid-walk and H: failed 1,141 of 23,399 cold reads.
+     <b>unread is not clean</b>, it is unmeasured. Check the Disk health tab for SMART as well —
+     the two answer different questions, and moving files off a drive is answered by this one.<br>
+     <b>Nothing here is deleted, ever.</b> Inventory is read-only; a drive becomes
      <i>retirable</i> only when every file on it is verified present elsewhere — 100%, not 99%.
      Volumes are keyed on the <b>NTFS volume serial</b>, not the letter and not the disk serial:
      ten USB disks here report only five distinct disk serials, because the bridges report
@@ -181,7 +190,7 @@ async function loadDrives(){
       $("#o-drives").innerHTML = vols.map(v => `
         <div class="card clk" data-vol="${v.id}">
           <div class="row">
-            <span class="chip state">${esc(v.state)}</span>
+            <span class="chip ${esc(v.health?.verdict || "unread")}">${esc(v.health?.verdict || "unread")}</span>
             <span class="name">${esc(v.drive_letter || "(no letter)")}</span>
             <span class="dim">${esc(v.label || "")}</span>
             <span class="dim">${esc(v.bus_type||"?")} · disk ${esc(v.disk_number)} · ${bytes(v.size_bytes)}</span>
@@ -191,6 +200,9 @@ async function loadDrives(){
             <span>${bytes(v.bytes)} <b>catalogued</b></span>
             <span>${num(v.finding_count)} <b>findings</b></span>
             <span>vol serial <b>${esc(v.volume_serial)}</b></span>
+            ${v.health && (v.health.io_errors || v.health.read_failures || v.health.retries) ?
+              `<span style="color:var(--bad)">${num(v.health.read_failures)} read failures ·
+               ${num(v.health.io_errors)} I/O errors · ${num(v.health.retries)} retries</span>` : ""}
           </div>
           <div class="bar" style="width:${Math.max(2, 100*Number(v.bytes||0)/max)}%;margin-top:9px"></div>
           <div class="note" id="f-${v.id}"></div>

@@ -217,10 +217,10 @@ export function ingestFindings(volumeId, scanId, rows) {
   return rows.length;
 }
 
-export function finishScan(scanId, status = "complete", { limited = false } = {}) {
+export function finishScan(scanId, status = "complete", { limited = false, ioErrors = 0, retries = 0 } = {}) {
   const d = open();
-  d.prepare(`UPDATE scans SET finished_at = ?, status = ?, limited = ? WHERE id = ?`)
-    .run(now(), status, limited ? 1 : 0, scanId);
+  d.prepare(`UPDATE scans SET finished_at = ?, status = ?, limited = ?, io_errors = ?, retries = ? WHERE id = ?`)
+    .run(now(), status, limited ? 1 : 0, ioErrors, retries, scanId);
   const s = d.prepare(`SELECT * FROM scans WHERE id = ?`).get(scanId);
   if (s?.volume_id) d.prepare(`UPDATE volumes SET last_scan = ? WHERE id = ?`).run(now(), s.volume_id);
   return s;
@@ -326,6 +326,10 @@ function migrate(d) {
   if (!scanCols.includes("limited")) {
     d.exec(`ALTER TABLE scans ADD COLUMN limited INTEGER NOT NULL DEFAULT 0`);
   }
+  if (!scanCols.includes("io_errors")) {
+    d.exec(`ALTER TABLE scans ADD COLUMN io_errors INTEGER NOT NULL DEFAULT 0`);
+    d.exec(`ALTER TABLE scans ADD COLUMN retries INTEGER NOT NULL DEFAULT 0`);
+  }
   const cols = d.prepare(`PRAGMA table_info(files)`).all().map((c) => c.name);
   if (!cols.includes("deleted_at")) {
     d.exec(`ALTER TABLE files ADD COLUMN deleted_at TEXT`);
@@ -416,4 +420,41 @@ export function deletedSummary(volumeId = null) {
   return open().prepare(
     `SELECT COUNT(*) n, COALESCE(SUM(size_bytes),0) b FROM files
      WHERE deleted_at IS NOT NULL ${where}`).get(...args);
+}
+
+/**
+ * READ HEALTH — what actually happened when we read this drive.
+ *
+ * SMART says what the drive believes about itself, and needs administrator rights. This says
+ * what happened when every file on it was opened, and needs nothing. For the question that
+ * matters here - "can I move 13 TB off this drive?" - the second is the more direct answer.
+ *
+ * It is also the only signal that caught anything real: Windows reported every drive on this
+ * machine as Healthy while E: threw an I/O device error mid-walk and H: failed 1,141 of 23,399
+ * cold reads.
+ *
+ * VERDICTS
+ *   unread     never scanned. Not healthy - unmeasured. (Same rule as the SMART panel.)
+ *   clean      scanned with no I/O errors, no retries, no hash failures.
+ *   flaky      errors or retries occurred but the reads eventually succeeded.
+ *   failing    reads that never succeeded. Do not plan a migration off this drive as-is.
+ */
+export function readHealth() {
+  const d = open();
+  return d.prepare(
+    `SELECT v.id, v.drive_letter, v.label, v.bus_type, v.disk_number, v.volume_serial,
+            (SELECT COUNT(*) FROM files f WHERE f.volume_id = v.id AND f.deleted_at IS NULL) AS files,
+            (SELECT COALESCE(SUM(io_errors),0) FROM scans s WHERE s.volume_id = v.id) AS io_errors,
+            (SELECT COALESCE(SUM(retries),0)   FROM scans s WHERE s.volume_id = v.id) AS retries,
+            (SELECT COUNT(*) FROM findings n WHERE n.volume_id = v.id
+                AND n.kind IN ('hash_failed','directory_unreadable','entry_unreadable',
+                               'enumeration_failed','volume_vanished')) AS read_failures,
+            (SELECT COUNT(*) FROM scans s WHERE s.volume_id = v.id) AS scans
+     FROM volumes v ORDER BY v.drive_letter`).all().map((r) => ({
+      ...r,
+      verdict: r.scans === 0 ? "unread"
+             : r.read_failures > 0 ? "failing"
+             : (r.io_errors > 0 || r.retries > 0) ? "flaky"
+             : "clean",
+    }));
 }

@@ -109,7 +109,10 @@ export async function ingestFile(path, onProgress) {
   }
   // Carry the scanner's own verdict through. reconcile() refuses a limited walk, and it can
   // only do that if the limitation survives the trip into the catalogue.
-  cat.finishScan(scanId, status, { limited: Boolean(summary?.limited || summary?.complete === false) });
+  cat.finishScan(scanId, status, {
+    limited: Boolean(summary?.limited || summary?.complete === false),
+    ioErrors: Number(summary?.io_errors || 0),
+  });
   return { ...counts, status, volumeId, summary };
 }
 
