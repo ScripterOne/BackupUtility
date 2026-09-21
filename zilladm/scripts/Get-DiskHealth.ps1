@@ -130,6 +130,7 @@ function Get-SmartReport {
         return [pscustomobject]@{
             available = $false; device_type = $null; exit_code = $null
             findings = @(); attributes = @{}; smart_status = 'UNKNOWN'
+            model = ''; serial = ''; firmware = ''; rotation_rate = $null
             detail = 'smartctl not installed. winget install smartmontools'
         }
     }
@@ -193,8 +194,15 @@ function Get-SmartReport {
             }
         }
 
-        $model = ''
+        $model = ''; $serial = ''; $firmware = ''; $rpm = $null
         try { $model = [string]$parsed.model_name } catch { }
+        # THE DRIVE'S OWN SERIAL, read through the bridge. Get-Disk cannot supply this - it
+        # reports the ASMedia bridge's canned per-bay id, which repeats across ten disks here.
+        # And disk NUMBERS move: H: was disk 6 earlier today and is disk 7 now. This is the only
+        # stable physical identity available, so health history can be keyed on it.
+        try { $serial = [string]$parsed.serial_number } catch { }
+        try { $firmware = [string]$parsed.firmware_version } catch { }
+        try { if ($parsed.PSObject.Properties['rotation_rate']) { $rpm = [int]$parsed.rotation_rate } } catch { }
 
         return [pscustomobject]@{
             available   = $true
@@ -204,6 +212,9 @@ function Get-SmartReport {
             attributes  = $attrs
             findings    = @($findings)
             model       = $model
+            serial      = $serial
+            firmware    = $firmware
+            rotation_rate = $rpm
             detail      = $null
         }
     }
@@ -211,7 +222,7 @@ function Get-SmartReport {
     return [pscustomobject]@{
         available = $false; device_type = $null; exit_code = $null
         smart_status = 'UNKNOWN'; attributes = @{}; findings = @()
-        model = ''
+        model = ''; serial = ''; firmware = ''; rotation_rate = $null
         detail = "No device type in the chain produced SMART data. Tried: auto, $($DeviceTypeChain -ne '' -join ', '). This is NOT a clean bill of health."
     }
 }
@@ -277,6 +288,7 @@ $results = foreach ($n in $targets) {
     $smart = if ($isAdmin) { Get-SmartReport -SmartCtl $smartCtl -Disk $n } else {
         [pscustomobject]@{ available = $false; device_type = $null; exit_code = $null
             smart_status = 'UNKNOWN'; attributes = @{}; findings = @(); model = ''
+            serial = ''; firmware = ''; rotation_rate = $null
             detail = 'Not run: administrator rights required. This is not a clean bill of health.' }
     }
 

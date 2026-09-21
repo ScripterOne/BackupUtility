@@ -130,8 +130,16 @@ createServer(async (req, res) => {
     }
   }
 
-  if (req.url === "/api/disk-health") {
-    const body = JSON.stringify(await diskHealth());
+  if (url.pathname === "/api/health-history") {
+    try { return json(res, { drives: cat.healthHistory() }); }
+    catch (e) { return json(res, { error: e.message, drives: [] }, 500); }
+  }
+  if (url.pathname === "/api/disk-health") {
+    const report = await diskHealth();
+    // Persist every reading. A single current value cannot distinguish noise from a trend, and
+    // the whole point of keeping track is to see one reallocated sector become four.
+    try { if (report.disks?.length) cat.recordHealth(report); } catch (e) { report.record_error = e.message; }
+    const body = JSON.stringify(report);
     res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
     return res.end(body);
   }

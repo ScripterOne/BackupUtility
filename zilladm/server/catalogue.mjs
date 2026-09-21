@@ -458,3 +458,92 @@ export function readHealth() {
              : "clean",
     }));
 }
+
+/**
+ * DISK HEALTH HISTORY.
+ *
+ * Keyed on the DRIVE'S OWN SERIAL, read by smartctl through the bridge. Nothing else here is a
+ * stable identity:
+ *   - drive letters move,
+ *   - the NTFS volume serial identifies a VOLUME, not the disk under it,
+ *   - Get-Disk's SerialNumber is the ASMedia bridge's canned per-bay id - disks 3 and 5 both
+ *     report 10C000000519 and are different drives,
+ *   - and disk NUMBERS move: H: was disk 6 this afternoon and disk 7 this evening.
+ *
+ * A snapshot per scan, never overwritten. The point is the TREND: one reallocated sector is
+ * noise, three more next month is a dying drive. A single current reading cannot tell you which
+ * you are looking at, and the earlier read-health verdict was wrong for exactly this reason -
+ * H: showed 'clean' because its failure history had been cleared.
+ */
+export function recordHealth(report) {
+  const d = open();
+  d.exec(`CREATE TABLE IF NOT EXISTS disk_health (
+    id           INTEGER PRIMARY KEY,
+    at           TEXT NOT NULL,
+    drive_serial TEXT,
+    model        TEXT,
+    firmware     TEXT,
+    bus_type     TEXT,
+    size_tb      REAL,
+    disk_number  INTEGER,
+    drive_letters TEXT,
+    verdict      TEXT,
+    smart_status TEXT,
+    device_type  TEXT,
+    power_on_hours     INTEGER,
+    reallocated        INTEGER,
+    pending            INTEGER,
+    offline_uncorrect  INTEGER,
+    udma_crc           INTEGER,
+    findings     TEXT,
+    attributes   TEXT
+  )`);
+  d.exec(`CREATE INDEX IF NOT EXISTS ix_health_serial ON disk_health(drive_serial, at)`);
+
+  const st = d.prepare(
+    `INSERT INTO disk_health (at, drive_serial, model, firmware, bus_type, size_tb, disk_number,
+       drive_letters, verdict, smart_status, device_type, power_on_hours, reallocated, pending,
+       offline_uncorrect, udma_crc, findings, attributes)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  const at = now();
+  let n = 0;
+  d.exec("BEGIN");
+  try {
+    for (const x of report.disks || []) {
+      const a = x.smart?.attributes || {};
+      st.run(at, x.smart?.serial || null, x.smart?.model || null, x.smart?.firmware || null,
+        x.bus_type || null, x.size_tb ?? null, x.disk_number ?? null,
+        (x.drive_letters || []).join(",") || null,
+        x.verdict || null, x.smart?.smart_status || null, x.smart?.device_type || null,
+        a.Power_On_Hours ?? null, a.Reallocated_Sector_Ct ?? null,
+        a.Current_Pending_Sector ?? null, a.Offline_Uncorrectable ?? null,
+        a.UDMA_CRC_Error_Count ?? null,
+        JSON.stringify(x.smart?.findings || []), JSON.stringify(a));
+      n++;
+    }
+    d.exec("COMMIT");
+  } catch (e) { d.exec("ROLLBACK"); throw e; }
+  return { recorded: n, at };
+}
+
+/** Latest reading per physical drive, with the change since the previous one. */
+export function healthHistory() {
+  const d = open();
+  try {
+    return d.prepare(
+      `WITH latest AS (
+         SELECT *, ROW_NUMBER() OVER (PARTITION BY drive_serial ORDER BY at DESC) rn
+         FROM disk_health WHERE drive_serial IS NOT NULL)
+       SELECT cur.drive_serial, cur.model, cur.drive_letters, cur.bus_type, cur.size_tb,
+              cur.verdict, cur.smart_status, cur.at,
+              cur.power_on_hours, cur.reallocated, cur.pending, cur.udma_crc,
+              prev.at AS prev_at,
+              cur.reallocated - COALESCE(prev.reallocated, cur.reallocated) AS d_reallocated,
+              cur.pending     - COALESCE(prev.pending, cur.pending)         AS d_pending,
+              cur.udma_crc    - COALESCE(prev.udma_crc, cur.udma_crc)       AS d_udma_crc,
+              (SELECT COUNT(*) FROM disk_health h WHERE h.drive_serial = cur.drive_serial) AS readings
+       FROM latest cur
+       LEFT JOIN latest prev ON prev.drive_serial = cur.drive_serial AND prev.rn = 2
+       WHERE cur.rn = 1 ORDER BY cur.drive_letters`).all();
+  } catch { return []; }
+}
