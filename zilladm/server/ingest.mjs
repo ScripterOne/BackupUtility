@@ -17,7 +17,8 @@
  */
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
-import { basename } from "node:path";
+import { basename, join } from "node:path";
+import { readdirSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import * as cat from "./catalogue.mjs";
 
@@ -114,7 +115,26 @@ export async function ingestFile(path, onProgress) {
 // with THREE slashes; hand-assembling "file://" + path yields two, the comparison
 // fails, and the CLI silently does nothing at all - no error, no output.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const paths = process.argv.slice(2);
+  const argv = process.argv.slice(2);
+  let paths = argv.filter((a) => !a.startsWith("--") && !/^[A-Z]$/i.test(a) || a.includes("."));
+
+  // --latest <LETTER> --dir <path>: pick the newest inventory for that drive. The GUI uses this
+  // so the operator never has to paste a timestamped filename, and so "ingest what I just
+  // scanned" cannot pick up a stale file by mistake.
+  if (argv.includes("--latest")) {
+    const letter = (argv[argv.indexOf("--latest") + 1] || "").replace(/:$/, "").toUpperCase();
+    const dir = argv.includes("--dir") ? argv[argv.indexOf("--dir") + 1] : ".";
+    const match = readdirSync(dir)
+      .filter((f) => f.startsWith(`inventory-${letter}-`) && f.endsWith(".ndjson"))
+      .sort();
+    if (!match.length) {
+      console.error(`no inventory-${letter}-*.ndjson in ${dir}`);
+      process.exit(1);
+    }
+    paths = [join(dir, match[match.length - 1])];
+    console.log(`latest for ${letter}: ${basename(paths[0])}`);
+  }
+
   if (!paths.length) {
     console.error("usage: node ingest.mjs <inventory.ndjson> [...]");
     process.exit(1);

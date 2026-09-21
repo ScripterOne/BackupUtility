@@ -258,3 +258,56 @@ export function search(q, limit = 200) {
        WHERE f.name LIKE ? LIMIT ?`).all(`%${q}%`, limit);
   }
 }
+
+/**
+ * Duplicate groups by content hash. This is the payoff: one row per group of byte-identical
+ * files, ordered by what dropping the redundant copies would recover.
+ *
+ * `waste` is size x (copies - 1) — the space freed by keeping ONE. It is deliberately not
+ * "total size of the group", which would overstate the recovery by the copy you keep.
+ */
+export function duplicates(volumeId = null, limit = 300, minWaste = 1024 * 1024) {
+  // A threshold, because without one this is 300 rows of 1 KB files and the 120 MB one is
+  // below the fold. The count of what is hidden is returned alongside so the filter cannot
+  // quietly hide the tail - see duplicateSummary().
+  const where = (volumeId ? "AND f.volume_id = ?" : "");
+  const args = volumeId ? [volumeId, minWaste, limit] : [minWaste, limit];
+  return open().prepare(
+    `SELECT f.sha256, COUNT(*) copies, MAX(f.size_bytes) size_bytes,
+            MAX(f.size_bytes) * (COUNT(*) - 1) AS waste,
+            MIN(f.name) AS name,
+            GROUP_CONCAT(DISTINCT v.drive_letter) AS drives
+     FROM files f JOIN volumes v ON v.id = f.volume_id
+     WHERE f.sha256 IS NOT NULL ${where}
+     GROUP BY f.sha256 HAVING COUNT(*) > 1 AND waste >= ?
+     ORDER BY waste DESC LIMIT ?`).all(...args);
+}
+
+export function duplicateSummary(volumeId = null) {
+  const where = volumeId ? "AND volume_id = ?" : "";
+  const args = volumeId ? [volumeId] : [];
+  const r = open().prepare(
+    `SELECT COUNT(*) groups, COALESCE(SUM(copies - 1),0) redundant,
+            COALESCE(SUM(sz * (copies - 1)),0) recoverable
+     FROM (SELECT sha256, COUNT(*) copies, MAX(size_bytes) sz FROM files
+           WHERE sha256 IS NOT NULL ${where} GROUP BY sha256 HAVING COUNT(*) > 1)`).get(...args);
+  const hashed = open().prepare(
+    `SELECT COUNT(*) n FROM files WHERE sha256 IS NOT NULL ${where}`).get(...args);
+  return { ...r, hashed: hashed.n };
+}
+
+/**
+ * Findings, worst first. `blocking` stops a drive being retired (plan §4 — the gate is 100%);
+ * `info` does not. Without that split, 3,168 benign pnpm symlinks would block a drive forever.
+ */
+export function findings(volumeId = null, limit = 400) {
+  const where = volumeId ? "WHERE n.volume_id = ?" : "";
+  const args = volumeId ? [volumeId, limit] : [limit];
+  return open().prepare(
+    `SELECT n.kind, n.detail, COUNT(*) count, MIN(n.path) example,
+            COALESCE(v.drive_letter,'?') drive,
+            CASE WHEN n.kind IN ('reparse_point_skipped') THEN 'info' ELSE 'blocking' END severity
+     FROM findings n LEFT JOIN volumes v ON v.id = n.volume_id ${where}
+     GROUP BY n.kind, n.detail, v.drive_letter
+     ORDER BY severity, count DESC LIMIT ?`).all(...args);
+}

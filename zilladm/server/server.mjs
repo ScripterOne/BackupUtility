@@ -15,6 +15,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as cat from "./catalogue.mjs";
+import * as jobs from "./jobs.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = join(HERE, "..", "scripts", "Get-DiskHealth.ps1");
@@ -78,6 +79,49 @@ createServer(async (req, res) => {
     if (!q) return json(res, { hits: [] });
     try { return json(res, { hits: cat.search(q) }); }
     catch (e) { return json(res, { error: e.message, hits: [] }, 500); }
+  }
+
+  // --- duplicates, findings, jobs --------------------------------------------------------
+  if (url.pathname === "/api/duplicates") {
+    const vol = Number(url.searchParams.get("volume")) || null;
+    const minMb = Number(url.searchParams.get("minMb") ?? 1);
+    try {
+      return json(res, {
+        groups: cat.duplicates(vol, 300, Math.round(minMb * 1024 * 1024)),
+        summary: cat.duplicateSummary(vol), min_mb: minMb,
+      });
+    }
+    catch (e) { return json(res, { error: e.message, groups: [] }, 500); }
+  }
+  if (url.pathname === "/api/findings") {
+    const vol = Number(url.searchParams.get("volume")) || null;
+    try { return json(res, { findings: cat.findings(vol) }); }
+    catch (e) { return json(res, { error: e.message, findings: [] }, 500); }
+  }
+  if (url.pathname === "/api/jobs") {
+    return json(res, { jobs: jobs.list(), running: jobs.running() });
+  }
+  if (url.pathname.startsWith("/api/jobs/") && req.method === "GET") {
+    const d = jobs.detail(url.pathname.slice("/api/jobs/".length));
+    return d ? json(res, d) : json(res, { error: "no such job" }, 404);
+  }
+  if (url.pathname === "/api/run" && req.method === "POST") {
+    // Long work is started here and watched via /api/jobs. It must not run inside the request:
+    // a million-file inventory is ten minutes and a browser tab closing must not kill it.
+    const kind = url.searchParams.get("kind");
+    const drive = url.searchParams.get("drive");
+    const excludeOs = url.searchParams.get("excludeOs") === "1";
+    try {
+      let j;
+      if (kind === "inventory") j = jobs.startInventory(drive, { excludeOs });
+      else if (kind === "ingest") j = jobs.startIngest(drive);
+      else if (kind === "fingerprint") j = jobs.startFingerprint(drive);
+      else return json(res, { error: `unknown kind '${kind}'` }, 400);
+      return json(res, { job: { id: j.id, label: j.label, status: j.status } });
+    } catch (e) {
+      // A refusal the operator can see beats a queue they cannot.
+      return json(res, { error: e.message }, 409);
+    }
   }
 
   if (req.url === "/api/disk-health") {

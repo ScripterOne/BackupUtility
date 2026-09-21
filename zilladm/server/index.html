@@ -28,6 +28,8 @@
   button.go{background:var(--accent);color:#04121c;border:0;border-radius:8px;
             padding:9px 16px;font-weight:650;cursor:pointer;font-size:14px}
   button.go[disabled]{opacity:.5;cursor:default}
+  select{background:var(--card);border:1px solid var(--line);color:var(--text);
+        border-radius:8px;padding:9px 10px;font-size:14px}
   input[type=search]{background:var(--card);border:1px solid var(--line);color:var(--text);
         border-radius:8px;padding:9px 12px;font-size:14px;width:100%;max-width:460px}
   .meta{color:var(--dim);font-size:12px;margin:12px 0 16px}
@@ -68,7 +70,10 @@
 
   <div class="tabs" role="tablist">
     <button class="tab" role="tab" data-tab="drives" aria-selected="true">Drives</button>
+    <button class="tab" role="tab" data-tab="dupes" aria-selected="false">Duplicates</button>
     <button class="tab" role="tab" data-tab="search" aria-selected="false">Search</button>
+    <button class="tab" role="tab" data-tab="jobs" aria-selected="false">Jobs</button>
+    <button class="tab" role="tab" data-tab="findings" aria-selected="false">Findings</button>
     <button class="tab" role="tab" data-tab="health" aria-selected="false">Disk health</button>
   </div>
 
@@ -76,6 +81,38 @@
     <button class="go" id="reload">Refresh</button>
     <div class="meta" id="m-drives"></div>
     <div id="o-drives"></div>
+  </section>
+
+  <section id="p-dupes" hidden>
+    <div class="row" style="gap:8px;margin-bottom:6px">
+      <label class="dim">show groups recovering at least</label>
+      <select id="d-min">
+        <option value="0">anything</option>
+        <option value="1" selected>1 MB</option>
+        <option value="10">10 MB</option>
+        <option value="100">100 MB</option>
+        <option value="1024">1 GB</option>
+      </select>
+    </div>
+    <div class="meta" id="m-dupes"></div>
+    <div id="o-dupes"></div>
+  </section>
+
+  <section id="p-jobs" hidden>
+    <div class="row" style="gap:8px;margin-bottom:10px">
+      <select id="j-drive"></select>
+      <label class="dim"><input type="checkbox" id="j-os" checked> ignore OS/cache files</label>
+      <button class="go" data-kind="inventory">Inventory</button>
+      <button class="go" data-kind="ingest">Ingest</button>
+      <button class="go" data-kind="fingerprint">Fingerprint</button>
+    </div>
+    <div class="meta" id="m-jobs"></div>
+    <div id="o-jobs"></div>
+  </section>
+
+  <section id="p-findings" hidden>
+    <div class="meta" id="m-findings"></div>
+    <div id="o-findings"></div>
   </section>
 
   <section id="p-search" hidden>
@@ -111,6 +148,16 @@ const LEGEND = {
      Volumes are keyed on the <b>NTFS volume serial</b>, not the letter and not the disk serial:
      ten USB disks here report only five distinct disk serials, because the bridges report
      themselves rather than the drives.`,
+  dupes: `<b>waste</b> is size x (copies - 1) — the space freed by keeping ONE, not the total
+     size of the group, which would overstate it by the copy you keep. Nothing here is deleted;
+     this is the report that tells you which drive is worth draining first.`,
+  jobs: `Jobs run as detached processes, so closing this tab does not kill a ten-minute scan.
+     <b>One job per physical disk</b> — two readers on one spindle is slower than one, and the
+     runner refuses rather than queueing silently. Inventory is read-only; fingerprint only
+     reads. Neither writes to your drives.`,
+  findings: `<b>blocking</b> stops a drive being retired — the gate is 100%, and an unreadable
+     file means the drive cannot be proven empty of anything. <b>info</b> does not: a pnpm
+     symlink farm is not a gap, because what it points at is inventoried at its real location.`,
   search: `Searches the catalogue, not the disks — so a file on a drive that is powered off,
      shelved or offline still answers. That is the point of keeping the index.`,
   health: `<b>UNKNOWN is not OK.</b> Most large drives here sit behind a USB-SATA bridge, and both
@@ -225,11 +272,85 @@ $("#scan").addEventListener("click", async () => {
   } finally { b.disabled = false; b.textContent = "Scan drives"; }
 });
 
+
+// ---------------------------------------------------------------- duplicates
+async function loadDupes(){
+  const min = $("#d-min").value;
+  const d = await (await fetch(`/api/duplicates?minMb=${min}`,{cache:"no-store"})).json();
+  const s = d.summary || {};
+  const shown = (d.groups||[]).length;
+  const hidden = Math.max(0, Number(s.groups||0) - shown);
+  $("#m-dupes").textContent = d.error ? d.error :
+    `${num(s.groups)} groups · ${num(s.redundant)} redundant copies · ${bytes(s.recoverable)} recoverable` +
+    ` · showing ${num(shown)}${hidden?`, ${num(hidden)} smaller hidden`:""}`;
+  const g = d.groups || [];
+  $("#o-dupes").innerHTML = g.length ? `<table><thead><tr><th>File</th><th class="num">Copies</th>
+      <th class="num">Each</th><th class="num">Recoverable</th><th>Drives</th></tr></thead><tbody>${
+      g.map(x=>`<tr><td>${esc(x.name)}</td><td class="num">${num(x.copies)}</td>
+        <td class="num">${bytes(x.size_bytes)}</td><td class="num">${bytes(x.waste)}</td>
+        <td class="dim">${esc(x.drives||"")}</td></tr>`).join("")}</tbody></table>`
+    : `<div class="empty">No duplicates yet — run a fingerprint pass.</div>`;
+}
+
+// ---------------------------------------------------------------- findings
+async function loadFindings(){
+  const d = await (await fetch("/api/findings",{cache:"no-store"})).json();
+  const f = d.findings || [];
+  const blocking = f.filter(x=>x.severity==="blocking").reduce((a,b)=>a+b.count,0);
+  $("#m-findings").textContent = `${num(blocking)} blocking · ${num(f.reduce((a,b)=>a+b.count,0)-blocking)} informational`;
+  $("#o-findings").innerHTML = f.length ? `<table><thead><tr><th>Severity</th><th>Kind</th>
+      <th class="num">Count</th><th>Drive</th><th>Example</th></tr></thead><tbody>${
+      f.map(x=>`<tr><td><span class="chip ${x.severity==="blocking"?"FAILING":"UNKNOWN"}">${esc(x.severity)}</span></td>
+        <td>${esc(x.kind)}</td><td class="num">${num(x.count)}</td><td class="dim">${esc(x.drive)}</td>
+        <td class="dim">${esc(String(x.example||"").slice(0,70))}</td></tr>`).join("")}</tbody></table>`
+    : `<div class="empty">No findings.</div>`;
+}
+
+// ---------------------------------------------------------------- jobs
+let jobTimer = null;
+async function loadJobs(){
+  const d = await (await fetch("/api/jobs",{cache:"no-store"})).json();
+  const j = d.jobs || [];
+  $("#m-jobs").textContent = `${num(d.running)} running · ${num(j.length)} this session`;
+  $("#o-jobs").innerHTML = j.length ? j.map(x=>`
+    <div class="card"><div class="row">
+      <span class="chip ${x.status==="running"?"ATTENTION":x.status==="complete"?"OK":"FAILING"}">${esc(x.status)}</span>
+      <span class="name">${esc(x.label)}</span>
+      <span class="dim">${esc(x.id)}${x.exit_code!==null?` · exit ${x.exit_code}`:""}</span>
+    </div><div class="note" style="font-family:ui-monospace,monospace">${esc(x.last||"")}</div></div>`).join("")
+    : `<div class="empty">Nothing run yet.</div>`;
+  // Poll only while something is running — a GUI that polls forever is a GUI that lies about
+  // being busy.
+  clearTimeout(jobTimer);
+  if (d.running) jobTimer = setTimeout(loadJobs, 1500);
+}
+document.querySelectorAll("#p-jobs button.go").forEach(b => b.addEventListener("click", async () => {
+  const drive = $("#j-drive").value;
+  if (!drive) return;
+  const q = new URLSearchParams({kind:b.dataset.kind, drive, excludeOs: $("#j-os").checked?"1":"0"});
+  const r = await fetch(`/api/run?${q}`, {method:"POST"});
+  const d = await r.json();
+  if (d.error) $("#m-jobs").textContent = d.error;
+  loadJobs();
+}));
+
+async function fillDrives(){
+  const letters = "CDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+  const d = await (await fetch("/api/volumes",{cache:"no-store"})).json();
+  const known = new Set((d.volumes||[]).map(v=>(v.drive_letter||"").replace(":","")));
+  $("#j-drive").innerHTML = letters.map(l =>
+    `<option value="${l}">${l}:${known.has(l)?" (catalogued)":""}</option>`).join("");
+}
+
 // ---------------------------------------------------------------- tabs
 document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
   document.querySelectorAll(".tab").forEach(x => x.setAttribute("aria-selected", String(x === t)));
-  for (const n of ["drives","search","health"]) $(`#p-${n}`).hidden = (n !== t.dataset.tab);
-  $("#legend").innerHTML = LEGEND[t.dataset.tab];
+  for (const n of ["drives","dupes","search","jobs","findings","health"]) $(`#p-${n}`).hidden = (n !== t.dataset.tab);
+  $("#legend").innerHTML = LEGEND[t.dataset.tab] || "";
+  if (t.dataset.tab === "dupes") loadDupes();
+  $("#d-min").onchange = loadDupes;
+  if (t.dataset.tab === "findings") loadFindings();
+  if (t.dataset.tab === "jobs") { fillDrives(); loadJobs(); }
 }));
 $("#legend").innerHTML = LEGEND.drives;
 $("#reload").addEventListener("click", loadDrives);
