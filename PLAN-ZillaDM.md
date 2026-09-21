@@ -357,6 +357,33 @@ catalogue's job includes answering what WAS on a drive, so live queries filter o
 and nothing is destroyed (R4).
 
 
+**R11 — THE TOOL ASSUMES USERS CHANGE THINGS UNDER IT.** *(Operator, 2026-09-20: "users are going
+to do naughty things like that!")* Files get deleted, trees get reorganised, drives get unplugged
+mid-scan and re-lettered on the next boot. None of that is misuse; it is Tuesday.
+
+**R11a — RETIREMENT NEVER ACCEPTS A CACHED VERDICT.** This is the one that can destroy data.
+A gate that says "every file on D: is verified present in the pool" is a statement about *the
+moment the scan ran*. If holiday photos were added to D: last week, the catalogue is correct
+about what it saw and wrong about what is there - and the tool would recommend wiping a drive
+holding the only copy of something.
+
+So retirement requires a **fresh walk immediately before**, compared against the catalogue, with
+any new or changed file blocking the retirement outright. The verdict expires; it is not stored.
+This is the same defect as a dashboard panel reporting a number it computed hours ago - correct
+once, and dangerous now.
+
+**R11b — A MOVED TREE IS NOT A DELETED ONE.** Reorganising 40,000 photos into new folders looks
+to a naive reconcile exactly like 40,000 deletions and 40,000 new files. Content hashes can tell
+the difference: same `sha256`, same volume, different path is a MOVE. Report it as one. Without
+that the deletion count is alarming noise, the duplicate count is wrong, and the operator learns
+to ignore both.
+
+**R11c — A VANISHED VOLUME IS NOT AN EMPTY ONE.** A drive unplugged or dropped off the USB bus
+mid-scan must abort the scan, not complete it - a walk that ends early because the volume
+disappeared would otherwise report every unreached file as missing. Check the volume is still
+mounted and still carries the same volume serial before writing a `complete` summary.
+
+
 **R1 — Idempotent.** Re-running any phase is a no-op on unchanged input. This is the original sin
 of the old tool and the single most important property of the new one.
 
