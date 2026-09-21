@@ -328,6 +328,35 @@ have been discovered in April.
 This is not a failure of memory. It is 16 TB across thirteen drives, which nobody holds in their
 head — **which is the entire reason the inventory comes before any decision.**
 
+**R10 — FAULT TOLERANCE IS A PRODUCT REQUIREMENT, not a nicety.** *(Operator, 2026-09-20: "if
+its a product, it has to be fault tolerant." And: the USB drives are NOT moving to internal SATA,
+so "we may need to slow down and monitor the use of the connection.")*
+
+A customer's hardware will be worse than this estate's and nobody will be watching it. Every one
+of these was earned by a real failure here, in one afternoon:
+
+| failure | what it cost | rule |
+| --- | --- | --- |
+| One unreadable directory aborted the entire walk | would have lost a 9-hour scan at hour 8 | a failure costs that directory, never the run |
+| `.NET` enumeration is LAZY - the throw happens in `MoveNext()`, not at the call | a try/catch that caught nothing | step the enumerator by hand |
+| 1,141 of 23,399 cold reads failed, all transient | 1,141 spurious BLOCKING findings, drive never retirable | retry transient faults; return permanent ones (`ENOENT`, `EACCES`) at once |
+| An interrupted scan started over | hours, repeatedly | checkpoint the pending directory stack |
+| The bus was hammered regardless of its health | more errors, and a bridge that can drop off entirely | adaptive pacing: back off FAST, recover SLOWLY |
+| A deleted 275 GB tree stayed in the catalogue | phantom duplicates inflating recoverable space | reconcile against the latest COMPLETE scan |
+
+**And the guard that matters most: reconciliation REFUSES a partial scan.** Deciding that files
+are gone because a walk did not see them is correct only if the walk saw everything. Pointed at a
+`-Limit` run, or an interrupted one, it would condemn every file the scan never reached - on a
+1.6 million file volume, a catastrophe that looks like success. It refuses unless the scan's own
+summary says `complete` and not `limited`, and that verdict is carried from the scanner through
+ingest into the `scans` table so the guard has something real to check.
+
+**Rows are marked `deleted_at`, never removed.** After Eidolon was deleted from `P:`, its 317,264
+catalogue rows were the only remaining record of which model weights had been there. The
+catalogue's job includes answering what WAS on a drive, so live queries filter on `deleted_at`
+and nothing is destroyed (R4).
+
+
 **R1 — Idempotent.** Re-running any phase is a no-op on unchanged input. This is the original sin
 of the old tool and the single most important property of the new one.
 
