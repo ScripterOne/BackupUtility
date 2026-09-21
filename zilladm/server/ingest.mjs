@@ -107,7 +107,9 @@ export async function ingestFile(path, onProgress) {
     status = status === "complete" ? "complete_with_bad_rows" : status;
     console.warn(`  ${counts.bad} unparsable line(s) skipped.`);
   }
-  cat.finishScan(scanId, status);
+  // Carry the scanner's own verdict through. reconcile() refuses a limited walk, and it can
+  // only do that if the limitation survives the trip into the catalogue.
+  cat.finishScan(scanId, status, { limited: Boolean(summary?.limited || summary?.complete === false) });
   return { ...counts, status, volumeId, summary };
 }
 

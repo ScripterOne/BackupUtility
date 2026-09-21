@@ -127,6 +127,7 @@ export function open() {
   mkdirSync(dirname(DB_PATH), { recursive: true });
   db = new DatabaseSync(DB_PATH);
   db.exec(SCHEMA);
+  migrate(db);
   try {
     db.exec(FTS);
   } catch (e) {
@@ -216,9 +217,10 @@ export function ingestFindings(volumeId, scanId, rows) {
   return rows.length;
 }
 
-export function finishScan(scanId, status = "complete") {
+export function finishScan(scanId, status = "complete", { limited = false } = {}) {
   const d = open();
-  d.prepare(`UPDATE scans SET finished_at = ?, status = ? WHERE id = ?`).run(now(), status, scanId);
+  d.prepare(`UPDATE scans SET finished_at = ?, status = ?, limited = ? WHERE id = ?`)
+    .run(now(), status, limited ? 1 : 0, scanId);
   const s = d.prepare(`SELECT * FROM scans WHERE id = ?`).get(scanId);
   if (s?.volume_id) d.prepare(`UPDATE volumes SET last_scan = ? WHERE id = ?`).run(now(), s.volume_id);
   return s;
@@ -227,8 +229,9 @@ export function finishScan(scanId, status = "complete") {
 export function volumes() {
   return open().prepare(
     `SELECT v.*,
-            (SELECT COUNT(*) FROM files f WHERE f.volume_id = v.id)          AS file_count,
-            (SELECT COALESCE(SUM(size_bytes),0) FROM files f WHERE f.volume_id = v.id) AS bytes,
+            (SELECT COUNT(*) FROM files f WHERE f.volume_id = v.id AND f.deleted_at IS NULL) AS file_count,
+            (SELECT COALESCE(SUM(size_bytes),0) FROM files f WHERE f.volume_id = v.id AND f.deleted_at IS NULL) AS bytes,
+            (SELECT COUNT(*) FROM files f WHERE f.volume_id = v.id AND f.deleted_at IS NOT NULL) AS gone_count,
             (SELECT COUNT(*) FROM findings n WHERE n.volume_id = v.id)       AS finding_count
      FROM volumes v ORDER BY v.drive_letter, v.label`).all();
 }
@@ -239,7 +242,7 @@ export function topFolders(volumeId, limit = 40) {
     `SELECT CASE WHEN instr(path, '\\') > 0
                  THEN substr(path, 1, instr(path, '\\') - 1) ELSE '(root)' END AS folder,
             COUNT(*) AS files, SUM(size_bytes) AS bytes
-     FROM files WHERE volume_id = ?
+     FROM files WHERE volume_id = ? AND deleted_at IS NULL
      GROUP BY folder ORDER BY bytes DESC LIMIT ?`).all(volumeId, limit);
 }
 
@@ -278,7 +281,7 @@ export function duplicates(volumeId = null, limit = 300, minWaste = 1024 * 1024)
             MIN(f.name) AS name,
             GROUP_CONCAT(DISTINCT v.drive_letter) AS drives
      FROM files f JOIN volumes v ON v.id = f.volume_id
-     WHERE f.sha256 IS NOT NULL ${where}
+     WHERE f.sha256 IS NOT NULL AND f.deleted_at IS NULL ${where}
      GROUP BY f.sha256 HAVING COUNT(*) > 1 AND waste >= ?
      ORDER BY waste DESC LIMIT ?`).all(...args);
 }
@@ -290,7 +293,7 @@ export function duplicateSummary(volumeId = null) {
     `SELECT COUNT(*) groups, COALESCE(SUM(copies - 1),0) redundant,
             COALESCE(SUM(sz * (copies - 1)),0) recoverable
      FROM (SELECT sha256, COUNT(*) copies, MAX(size_bytes) sz FROM files
-           WHERE sha256 IS NOT NULL ${where} GROUP BY sha256 HAVING COUNT(*) > 1)`).get(...args);
+           WHERE sha256 IS NOT NULL AND deleted_at IS NULL ${where} GROUP BY sha256 HAVING COUNT(*) > 1)`).get(...args);
   const hashed = open().prepare(
     `SELECT COUNT(*) n FROM files WHERE sha256 IS NOT NULL ${where}`).get(...args);
   return { ...r, hashed: hashed.n };
@@ -310,4 +313,107 @@ export function findings(volumeId = null, limit = 400) {
      FROM findings n LEFT JOIN volumes v ON v.id = n.volume_id ${where}
      GROUP BY n.kind, n.detail, v.drive_letter
      ORDER BY severity, count DESC LIMIT ?`).all(...args);
+}
+
+/**
+ * Migration: files.deleted_at, added 2026-09-20.
+ *
+ * SQLite has no "ADD COLUMN IF NOT EXISTS", and the schema above uses CREATE TABLE IF NOT
+ * EXISTS, so an existing catalogue never gets new columns from it. Check and add.
+ */
+function migrate(d) {
+  const scanCols = d.prepare(`PRAGMA table_info(scans)`).all().map((c) => c.name);
+  if (!scanCols.includes("limited")) {
+    d.exec(`ALTER TABLE scans ADD COLUMN limited INTEGER NOT NULL DEFAULT 0`);
+  }
+  const cols = d.prepare(`PRAGMA table_info(files)`).all().map((c) => c.name);
+  if (!cols.includes("deleted_at")) {
+    d.exec(`ALTER TABLE files ADD COLUMN deleted_at TEXT`);
+    d.exec(`CREATE INDEX IF NOT EXISTS ix_files_live ON files(volume_id) WHERE deleted_at IS NULL`);
+  }
+}
+
+/**
+ * Reconcile a volume against its latest COMPLETE scan: anything not seen is marked gone.
+ *
+ * WHY MARKED AND NOT DELETED. The catalogue's value is partly historical - after Eidolon was
+ * deleted from P:, its 317,264 rows were the only remaining record of which model weights had
+ * been there. That record is worth keeping (plan R4, provenance). So `deleted_at` is set and
+ * every live query filters on it; nothing is destroyed.
+ *
+ * WHY IT REFUSES A PARTIAL SCAN. This decides that files are gone because a scan did not see
+ * them. Run it against a -Limit run, or an interrupted one, and it condemns everything the walk
+ * never reached - which on a 1.6 million file volume is a catastrophe that looks like success.
+ * So: only a scan whose status is 'complete' AND which was not limited.
+ */
+export function reconcile(volumeId, { dryRun = false } = {}) {
+  const d = open();
+  const scan = d.prepare(
+    `SELECT * FROM scans WHERE volume_id = ? AND phase = 'inventory' AND status = 'complete'
+     ORDER BY id DESC LIMIT 1`).get(volumeId);
+  if (!scan) {
+    return { refused: "no completed inventory scan for this volume - nothing may be marked gone" };
+  }
+  if (scan.limited) {
+    return { refused: `scan ${scan.id} was limited; a partial walk cannot decide what is missing` };
+  }
+
+  const stale = d.prepare(
+    `SELECT COUNT(*) n, COALESCE(SUM(size_bytes),0) b FROM files
+     WHERE volume_id = ? AND deleted_at IS NULL AND (scan_id IS NULL OR scan_id <> ?)`)
+    .get(volumeId, scan.id);
+
+  /*
+    R11b - A MOVED TREE IS NOT A DELETED ONE.
+
+    Reorganising 40,000 photos into new folders looks, to a naive reconcile, exactly like 40,000
+    deletions and 40,000 creations. Content hashes tell them apart: same sha256, same volume,
+    seen in THIS scan at a different path, is a MOVE.
+
+    Reported separately rather than suppressed, because a move is still worth knowing about -
+    and because a large move count next to a large delete count is usually the same event,
+    which is precisely what the operator needs to see to trust the delete number.
+
+    The honest limit: a file with no sha256 cannot be classified at all. Without a hash a move
+    and a delete are indistinguishable, so those are counted apart rather than guessed at. An
+    unhashed disappearance is 'unknown', not 'deleted'.
+  */
+  const moved = d.prepare(
+    `SELECT COUNT(*) n FROM files old
+     WHERE old.volume_id = ? AND old.deleted_at IS NULL
+       AND (old.scan_id IS NULL OR old.scan_id <> ?)
+       AND old.sha256 IS NOT NULL
+       AND EXISTS (SELECT 1 FROM files cur
+                   WHERE cur.volume_id = old.volume_id AND cur.scan_id = ?
+                     AND cur.sha256 = old.sha256 AND cur.path <> old.path)`)
+    .get(volumeId, scan.id, scan.id);
+
+  const unhashed = d.prepare(
+    `SELECT COUNT(*) n FROM files
+     WHERE volume_id = ? AND deleted_at IS NULL AND (scan_id IS NULL OR scan_id <> ?)
+       AND sha256 IS NULL`).get(volumeId, scan.id);
+
+  const detail = {
+    scan_id: scan.id,
+    gone: stale.n, bytes: stale.b,
+    moved: moved.n,
+    unclassifiable: unhashed.n,
+    truly_gone: stale.n - moved.n,
+  };
+
+  if (dryRun) return { ...detail, would_mark: stale.n };
+
+  d.prepare(
+    `UPDATE files SET deleted_at = ?
+     WHERE volume_id = ? AND deleted_at IS NULL AND (scan_id IS NULL OR scan_id <> ?)`)
+    .run(new Date().toISOString(), volumeId, scan.id);
+  return { ...detail, marked: stale.n };
+}
+
+export function deletedSummary(volumeId = null) {
+  const where = volumeId ? "AND volume_id = ?" : "";
+  const args = volumeId ? [volumeId] : [];
+  return open().prepare(
+    `SELECT COUNT(*) n, COALESCE(SUM(size_bytes),0) b FROM files
+     WHERE deleted_at IS NOT NULL ${where}`).get(...args);
 }

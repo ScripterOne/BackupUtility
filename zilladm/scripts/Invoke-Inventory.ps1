@@ -160,6 +160,35 @@ if (-not $header.volume_serial) {
     one produces NDJSON that parses fine for a million rows and then fails, which is the worst
     possible failure mode for a two-hour scan.
 #>
+
+<#
+    R11c - A VANISHED VOLUME IS NOT AN EMPTY ONE.
+
+    If a drive drops off the USB bus mid-walk - and these enclosures do, one of them needs a
+    power-cycle to re-enumerate - every directory still on the stack becomes unreachable. The
+    walk would then end early and write a `complete` summary, and reconciliation would read that
+    as "everything not seen has been deleted". On a large volume that is a catastrophe shaped
+    exactly like success.
+
+    So the volume is re-checked at every checkpoint AND immediately before the summary is
+    written. It must still be mounted and must still carry the SAME NTFS volume serial - a
+    re-enumerated drive can come back on the same letter as a different volume, which is the
+    worst case of all because nothing looks wrong.
+#>
+function Test-VolumeStillPresent {
+    param([string] $Letter, [string] $ExpectedSerial)
+    try {
+        $v = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='${Letter}:'" -ErrorAction Stop
+        if (-not $v) { return @{ ok = $false; reason = 'volume is no longer mounted' } }
+        if ($ExpectedSerial -and "$($v.VolumeSerialNumber)" -ne $ExpectedSerial) {
+            return @{ ok = $false; reason = "volume serial changed: expected $ExpectedSerial, found $($v.VolumeSerialNumber)" }
+        }
+        return @{ ok = $true; reason = $null }
+    } catch {
+        return @{ ok = $false; reason = "volume check failed: $($_.Exception.Message)" }
+    }
+}
+
 function ConvertTo-JsonString {
     param([string] $s)
     if ($null -eq $s) { return 'null' }
@@ -197,6 +226,7 @@ if (-not $resuming) { $writer.WriteLine(($header | ConvertTo-Json -Compress -Dep
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $files = 0; [int64]$bytes = 0; $findings = 0; $dirs = 0
 $throttle = $ThrottleMs
+$volumeLost = $null
 $ioErrors = 0          # blocking I/O failures this run - the connection health signal
 $ioErrorsAtLastCheck = 0
 $cleanDirs = 0
@@ -331,6 +361,17 @@ while ($stack.Count -gt 0) {
                pending = @($stack.ToArray()); at = (Get-Date).ToString('o')
             } | ConvertTo-Json -Compress -Depth 4 | Set-Content -LiteralPath $checkpoint -Encoding utf8
         } catch { }   # a checkpoint that cannot be written must not stop the walk
+
+        $present = Test-VolumeStillPresent -Letter $letter -ExpectedSerial $header.volume_serial
+        if (-not $present.ok) {
+            $writer.WriteLine(
+                '{"type":"finding","severity":"blocking","kind":"volume_vanished","path":null,"detail":' +
+                (ConvertTo-JsonString $present.reason) + '}')
+            $findings++
+            $volumeLost = $present.reason
+            $stack.Clear()
+            break
+        }
     }
 
     if (($dirs % 500) -eq 0) {
@@ -342,19 +383,34 @@ while ($stack.Count -gt 0) {
 }
 
 $sw.Stop()
+$final = Test-VolumeStillPresent -Letter $letter -ExpectedSerial $header.volume_serial
+if (-not $final.ok -and $null -eq $volumeLost) { $volumeLost = $final.reason }
 $writer.WriteLine(([ordered]@{
     type = 'summary'; files = $files; bytes = $bytes; findings = $findings; directories = $dirs
     seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
     io_errors = $ioErrors; final_throttle_ms = $throttle; adaptive = [bool]$Adaptive
+    # COMPLETE means the stack emptied on its own. A -Limit run stopped early and must never be
+    # used to decide that unseen files were deleted - it would condemn everything not reached.
+    complete = (($Limit -le 0 -or $files -lt $Limit) -and $null -eq $volumeLost)
+    limited = ($Limit -gt 0)
+    volume_lost = $volumeLost
 } | ConvertTo-Json -Compress))
 $writer.Flush(); $writer.Close()
 # A completed walk leaves no checkpoint - otherwise -Resume would restart a finished scan.
-if (Test-Path -LiteralPath $checkpoint) { Remove-Item -LiteralPath $checkpoint -Force -EA SilentlyContinue }
+# A walk that lost its volume KEEPS its checkpoint: it is interrupted, not finished, and
+# deleting it would throw away hours of work over a cable.
+if ($null -eq $volumeLost -and (Test-Path -LiteralPath $checkpoint)) {
+    Remove-Item -LiteralPath $checkpoint -Force -EA SilentlyContinue
+}
 
 Write-Host ""
 Write-Host ("  {0}: {1:N0} files, {2:N1} GB, {3:N0} dirs, {4:N0} findings in {5:N1}s ({6:N0} files/sec)" -f
     $root, $files, ($bytes / 1GB), $dirs, $findings, $sw.Elapsed.TotalSeconds,
     ($files / [Math]::Max($sw.Elapsed.TotalSeconds, 0.001))) -ForegroundColor Green
+if ($volumeLost) {
+    Write-Host ("  VOLUME LOST: {0}" -f $volumeLost) -ForegroundColor Red
+    Write-Host "  This scan is INCOMPLETE and is marked so. Checkpoint kept - rerun with -Resume." -ForegroundColor Red
+}
 if ($ioErrors -gt 0) {
     Write-Host ("  CONNECTION: {0} I/O error(s); throttle ended at {1} ms. This bus is struggling." -f
         $ioErrors, $throttle) -ForegroundColor Yellow
