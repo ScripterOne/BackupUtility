@@ -47,7 +47,24 @@ param(
     [Parameter(Mandatory)] [string] $DriveLetter,
     [string] $Out,
     [switch] $ExcludeOsFiles,
-    [int] $Limit = 0
+    [int] $Limit = 0,
+
+    # Milliseconds to pause between directories. The drives here live behind a chained-hub USB
+    # DAS that drops I/O under sustained load, and they are staying there - so being a good
+    # citizen on a fragile bus matters more than finishing quickly.
+    [int] $ThrottleMs = 0,
+
+    # Raise the throttle automatically when the bus starts complaining, and lower it when it
+    # stops. Without this the operator has to guess a number, and the right number changes with
+    # what else is touching the enclosure.
+    [switch] $Adaptive,
+
+    [int] $MaxThrottleMs = 750,
+
+    # Resume an interrupted walk instead of starting over. A 9 TB volume is hours; losing hour
+    # eight to a dropped USB bridge, a reboot or a closed lid is the difference between a tool
+    # and a product.
+    [switch] $Resume
 )
 
 Set-StrictMode -Version Latest
@@ -66,9 +83,39 @@ $osSkip = @('Windows', 'Program Files', 'Program Files (x86)', 'ProgramData', 'A
             'node_modules', '.git', '.pnpm-store', 'Steam', 'SteamLibrary',
             '$WinREAgent', 'Recovery', 'PerfLogs')
 
+$buildDir = Join-Path $PSScriptRoot '..\build'
+if (-not (Test-Path $buildDir)) { New-Item -ItemType Directory -Path $buildDir | Out-Null }
+
+<#
+    RESUME.
+
+    The checkpoint is the PENDING DIRECTORY STACK, not a file offset. Directories are the unit
+    of work here - the walk pops one, emits everything in it, and pushes its children - so a
+    stack snapshot plus the NDJSON written so far is a complete, consistent restart point.
+    Re-walking a directory that was already emitted is harmless: ingest upserts on
+    (volume_id, path), so a duplicated row updates rather than doubling. That is R1 earning its
+    keep in a place it was not designed for.
+
+    Checkpoint per volume, not per run, so -Resume needs no filename.
+#>
+$checkpoint = Join-Path $buildDir ("checkpoint-{0}.json" -f $letter)
+$resuming = $false
+if ($Resume -and (Test-Path -LiteralPath $checkpoint)) {
+    try {
+        $cp = Get-Content -Raw -LiteralPath $checkpoint | ConvertFrom-Json
+        if ($cp.volume_serial -eq $header.volume_serial -and (Test-Path -LiteralPath $cp.out)) {
+            $Out = $cp.out
+            $resuming = $true
+            Write-Host ("  resuming: {0:N0} files already recorded, {1:N0} directories pending" -f
+                $cp.files, $cp.pending.Count) -ForegroundColor Cyan
+        } else {
+            # A checkpoint for a DIFFERENT volume that happens to share this letter is the exact
+            # trap drive letters exist to create. Refuse it rather than merge two drives.
+            Write-Warning "Checkpoint is for volume $($cp.volume_serial), this is $($header.volume_serial). Starting fresh."
+        }
+    } catch { Write-Warning "Checkpoint unreadable, starting fresh: $($_.Exception.Message)" }
+}
 if (-not $Out) {
-    $buildDir = Join-Path $PSScriptRoot '..\build'
-    if (-not (Test-Path $buildDir)) { New-Item -ItemType Directory -Path $buildDir | Out-Null }
     $Out = Join-Path $buildDir ("inventory-{0}-{1}.ndjson" -f $letter, (Get-Date -Format 'yyyyMMdd-HHmmss'))
 }
 
@@ -132,16 +179,40 @@ function ConvertTo-JsonString {
     return $sb.ToString()
 }
 
-$writer = [System.IO.StreamWriter]::new($Out, $false, [System.Text.UTF8Encoding]::new($false), 1048576)
-$writer.WriteLine(($header | ConvertTo-Json -Compress -Depth 5))
+$writer = [System.IO.StreamWriter]::new($Out, $resuming, [System.Text.UTF8Encoding]::new($false), 1048576)
+if (-not $resuming) { $writer.WriteLine(($header | ConvertTo-Json -Compress -Depth 5)) }
 
+<#
+    CONNECTION PACING.
+
+    Measured 2026-09-20: E: threw 'The request could not be performed because of an I/O device
+    error' on a cold walk, and H: failed 1,141 of 23,399 cold reads. Both sit on the same
+    chained-hub USB DAS whose sustained WRITES were already known to fail. These drives are not
+    moving to internal SATA, so the tool adapts to the bus rather than the other way round.
+
+    The adaptive rule is deliberately asymmetric: back off FAST on trouble, recover SLOWLY.
+    A bus that has just errored is more likely to error again, and a scan that speeds up
+    immediately after a fault simply reproduces it.
+#>
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $files = 0; [int64]$bytes = 0; $findings = 0; $dirs = 0
+$throttle = $ThrottleMs
+$ioErrors = 0          # blocking I/O failures this run - the connection health signal
+$ioErrorsAtLastCheck = 0
+$cleanDirs = 0
 $rootLen = $root.Length
 
 # Explicit stack, so one unreadable directory costs that directory and nothing else.
 $stack = [System.Collections.Generic.Stack[string]]::new()
-$stack.Push($root)
+if ($resuming) {
+    # Push in reverse so the stack pops in the order it was saved - otherwise a resumed walk
+    # visits the tree backwards, which still works but makes two runs impossible to compare.
+    for ($i = $cp.pending.Count - 1; $i -ge 0; $i--) { $stack.Push([string]$cp.pending[$i]) }
+    $files = [int]$cp.files; [int64]$bytes = [int64]$cp.bytes
+    $findings = [int]$cp.findings; $dirs = [int]$cp.dirs
+} else {
+    $stack.Push($root)
+}
 
 while ($stack.Count -gt 0) {
     $dir = $stack.Pop()
@@ -190,6 +261,7 @@ while ($stack.Count -gt 0) {
                 (ConvertTo-JsonString $dir.Substring([Math]::Min($rootLen, $dir.Length))) +
                 ',"detail":' + (ConvertTo-JsonString $_.Exception.Message) + '}')
             $findings++
+            $ioErrors++
             break
         }
         try {
@@ -231,9 +303,40 @@ while ($stack.Count -gt 0) {
         }
     }
 
+    # ---- pacing -------------------------------------------------------------------------
+    if ($Adaptive -and ($dirs % 25) -eq 0) {
+        if ($ioErrors -gt $ioErrorsAtLastCheck) {
+            # Trouble: double the pause immediately, from a 25 ms floor so the first step is real.
+            $throttle = [Math]::Min($MaxThrottleMs, [Math]::Max(25, $throttle * 2))
+            $ioErrorsAtLastCheck = $ioErrors
+            $cleanDirs = 0
+        } else {
+            $cleanDirs += 25
+            # Recover only after a long clean stretch, and only one step at a time.
+            if ($cleanDirs -ge 500 -and $throttle -gt $ThrottleMs) {
+                $throttle = [Math]::Max($ThrottleMs, [int]($throttle / 2))
+                $cleanDirs = 0
+            }
+        }
+    }
+    if ($throttle -gt 0) { Start-Sleep -Milliseconds $throttle }
+
+    # Checkpoint every 250 directories. Flush FIRST: a checkpoint claiming rows that are still
+    # in the write buffer would resume past data that never reached disk.
+    if (($dirs % 250) -eq 0) {
+        try {
+            $writer.Flush()
+            @{ volume_serial = $header.volume_serial; out = $Out; files = $files
+               bytes = $bytes; findings = $findings; dirs = $dirs
+               pending = @($stack.ToArray()); at = (Get-Date).ToString('o')
+            } | ConvertTo-Json -Compress -Depth 4 | Set-Content -LiteralPath $checkpoint -Encoding utf8
+        } catch { }   # a checkpoint that cannot be written must not stop the walk
+    }
+
     if (($dirs % 500) -eq 0) {
-        Write-Host ("  {0,10:N0} files  {1,8:N1} GB  {2,6:N0} dirs  {3,7:N0} files/sec" -f
-            $files, ($bytes / 1GB), $dirs, ($files / [Math]::Max($sw.Elapsed.TotalSeconds, 0.001))) -NoNewline
+        Write-Host ("  {0,10:N0} files  {1,8:N1} GB  {2,6:N0} dirs  {3,6:N0} f/s  throttle {4,4}ms  io-err {5}" -f
+            $files, ($bytes / 1GB), $dirs, ($files / [Math]::Max($sw.Elapsed.TotalSeconds, 0.001)),
+            $throttle, $ioErrors) -NoNewline
         Write-Host "`r" -NoNewline
     }
 }
@@ -242,11 +345,18 @@ $sw.Stop()
 $writer.WriteLine(([ordered]@{
     type = 'summary'; files = $files; bytes = $bytes; findings = $findings; directories = $dirs
     seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+    io_errors = $ioErrors; final_throttle_ms = $throttle; adaptive = [bool]$Adaptive
 } | ConvertTo-Json -Compress))
 $writer.Flush(); $writer.Close()
+# A completed walk leaves no checkpoint - otherwise -Resume would restart a finished scan.
+if (Test-Path -LiteralPath $checkpoint) { Remove-Item -LiteralPath $checkpoint -Force -EA SilentlyContinue }
 
 Write-Host ""
 Write-Host ("  {0}: {1:N0} files, {2:N1} GB, {3:N0} dirs, {4:N0} findings in {5:N1}s ({6:N0} files/sec)" -f
     $root, $files, ($bytes / 1GB), $dirs, $findings, $sw.Elapsed.TotalSeconds,
     ($files / [Math]::Max($sw.Elapsed.TotalSeconds, 0.001))) -ForegroundColor Green
+if ($ioErrors -gt 0) {
+    Write-Host ("  CONNECTION: {0} I/O error(s); throttle ended at {1} ms. This bus is struggling." -f
+        $ioErrors, $throttle) -ForegroundColor Yellow
+}
 Write-Host "  -> $Out" -ForegroundColor DarkGray
