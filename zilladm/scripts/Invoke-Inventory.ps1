@@ -146,19 +146,52 @@ $stack.Push($root)
 while ($stack.Count -gt 0) {
     $dir = $stack.Pop()
     $dirs++
-    try {
-        $entries = ([System.IO.DirectoryInfo]$dir).EnumerateFileSystemInfos()
-    } catch {
+    $entries = $null
+    for ($try = 0; $try -lt 3; $try++) {
+        try { $entries = ([System.IO.DirectoryInfo]$dir).EnumerateFileSystemInfos(); break }
+        catch { Start-Sleep -Milliseconds (50 * [Math]::Pow(2, $try)) }
+    }
+    if ($null -eq $entries) {
+        try { throw "directory could not be opened after 3 attempts" } catch {
         # R6: a skip is a finding, never a silence.
         $writer.WriteLine(
             '{"type":"finding","severity":"blocking","kind":"directory_unreadable","path":' +
             (ConvertTo-JsonString $dir.Substring([Math]::Min($rootLen, $dir.Length))) +
             ',"detail":' + (ConvertTo-JsonString $_.Exception.GetType().Name) + '}')
         $findings++
+        }
         continue
     }
 
-    foreach ($e in $entries) {
+    <#
+        MANUAL ENUMERATOR, not `foreach ($e in $entries)`.
+
+        .NET directory enumeration is LAZY: EnumerateFileSystemInfos() returns immediately and
+        the I/O happens inside MoveNext(). A try/catch around the CALL therefore catches almost
+        nothing, and an exception thrown mid-iteration escapes the loop entirely.
+
+        Measured 2026-09-20: the E: scan died at 42,063 files on
+        'The request could not be performed because of an I/O device error' inside a __pycache__
+        directory. With $ErrorActionPreference = 'Stop' that terminated the whole script. A
+        nine-hour walk would have been lost at hour eight to one bad directory on a USB bridge
+        that is known to drop I/O under load.
+
+        So MoveNext() is stepped by hand. A failure costs the REST OF THAT DIRECTORY, is recorded
+        as a blocking finding, and the walk continues with the rest of the stack.
+    #>
+    $en = $entries.GetEnumerator()
+    while ($true) {
+        try {
+            if (-not $en.MoveNext()) { break }
+            $e = $en.Current
+        } catch {
+            $writer.WriteLine(
+                '{"type":"finding","severity":"blocking","kind":"enumeration_failed","path":' +
+                (ConvertTo-JsonString $dir.Substring([Math]::Min($rootLen, $dir.Length))) +
+                ',"detail":' + (ConvertTo-JsonString $_.Exception.Message) + '}')
+            $findings++
+            break
+        }
         try {
             $name = $e.Name
             if ($e -is [System.IO.DirectoryInfo]) {
