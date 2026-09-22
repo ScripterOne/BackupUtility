@@ -34,6 +34,7 @@ business on a LAN interface; the agent↔server protocol that will need auth is 
 ```powershell
 pwsh -File .\zilladm\scripts\Export-DiskEvents.ps1 -Days 3     # READ-ONLY: event logs + PnP tree
 node .\zilladm\server\diagnose.mjs $env:TEMP\zilladm-disk-events.json
+node --test                                                    # from the repo root (a path arg is run as a module, not discovered)
 ```
 
 Windows reports disk errors against a **disk number**, and disk numbers move: on 2026-09-21 one
@@ -57,3 +58,15 @@ parent hub made one bay look like two and turned a path fault into a false "bad 
 
 Run on the real 3-day window on 2026-09-22: 15,838 errors attributed, **14,789 of them across four
 drives on one enclosure - all five drives `path_fault`, none blamed.**
+
+### Drives move between machines
+
+Letters and disk numbers do not survive a move to another computer; the SMART serial does, so the
+ledger (`server/disposition.mjs`) keys on it and records the HOST each change happened on. A drive
+carries one history across machines, and `hostsSeen()` reads it back - a fault seen on two different
+hosts is the strongest evidence there is that the drive itself is the problem, stronger than two
+enclosures on one machine, which can share a controller.
+
+Retiring a drive as a hardware failure is refused unless the errors followed it (another enclosure,
+or another host) or SMART shows pending/offline-uncorrectable sectors or reallocations that grew. A
+UDMA CRC count is the cable or the bridge and never retires a drive.

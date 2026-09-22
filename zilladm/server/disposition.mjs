@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS drive_disposition (
   id           INTEGER PRIMARY KEY,
   at           TEXT NOT NULL,
   drive_key    TEXT NOT NULL,      -- SMART serial where known; never a drive letter or disk number
+  host         TEXT,               -- the machine it was in when this happened
   from_status  TEXT,
   to_status    TEXT NOT NULL,
   cause        TEXT,               -- e.g. hardware_failure, path_fault, operator_request
@@ -37,6 +38,10 @@ CREATE INDEX IF NOT EXISTS ix_disposition_drive ON drive_disposition(drive_key, 
 
 export function ensure(db) {
   db.exec(SCHEMA);
+  // These drives move between machines (operator, 2026-09-22), so a ledger written before `host`
+  // existed still has to open. SQLite has no ADD COLUMN IF NOT EXISTS; asking is the portable way.
+  const cols = db.prepare(`PRAGMA table_info(drive_disposition)`).all().map((c) => c.name);
+  if (!cols.includes("host")) db.exec(`ALTER TABLE drive_disposition ADD COLUMN host TEXT`);
   return db;
 }
 
@@ -94,7 +99,7 @@ export function supportsHardwareFailure(evidence = {}) {
 /**
  * Record a status change. Refuses a hardware-failure retirement the evidence does not support.
  */
-export function setStatus(db, { driveKey, to, actor, reason, cause = null, evidence = null, at = new Date().toISOString() }) {
+export function setStatus(db, { driveKey, to, actor, reason, cause = null, evidence = null, host = null, at = new Date().toISOString() }) {
   ensure(db);
   if (!driveKey) throw new Error("driveKey is required: identify a drive by its SMART serial, never by letter or disk number");
   if (!STATUSES.includes(to)) throw new Error(`unknown status '${to}'; one of ${STATUSES.join(", ")}`);
@@ -112,22 +117,38 @@ export function setStatus(db, { driveKey, to, actor, reason, cause = null, evide
     reason = `${reason} [evidence: ${check.because}]`;
   }
   db.prepare(
-    `INSERT INTO drive_disposition (at, drive_key, from_status, to_status, cause, actor, reason, evidence)
-     VALUES (?,?,?,?,?,?,?,?)`,
-  ).run(at, driveKey, from, to, cause, actor, reason, evidence ? JSON.stringify(evidence) : null);
-  return { driveKey, from, to, at, cause, reason };
+    `INSERT INTO drive_disposition (at, drive_key, host, from_status, to_status, cause, actor, reason, evidence)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).run(at, driveKey, host, from, to, cause, actor, reason, evidence ? JSON.stringify(evidence) : null);
+  return { driveKey, host, from, to, at, cause, reason };
 }
 
-/** Every drive the ledger knows, with its current status and when it last changed. */
+/** Every drive the ledger knows, with its current status, where it last was, and when. */
 export function roster(db) {
   ensure(db);
   return db
     .prepare(
-      `SELECT d.drive_key, d.to_status AS status, d.at, d.cause, d.reason
+      `SELECT d.drive_key, d.to_status AS status, d.host, d.at, d.cause, d.reason
          FROM drive_disposition d
          JOIN (SELECT drive_key, MAX(id) AS id FROM drive_disposition GROUP BY drive_key) last
            ON last.id = d.id
         ORDER BY d.drive_key`,
     )
     .all();
+}
+
+/**
+ * Where this drive has been, in order. These drives move between machines, and a drive carries its
+ * history with it: the serial is the same on the next computer, the letter and disk number are not.
+ * A fault seen on two DIFFERENT HOSTS is the strongest evidence there is that the drive is the
+ * problem - stronger than two enclosures on one machine, which can share a controller.
+ */
+export function hostsSeen(db, driveKey) {
+  ensure(db);
+  const rows = db
+    .prepare(`SELECT host, MIN(at) AS first_seen, MAX(at) AS last_seen, COUNT(*) AS events
+                FROM drive_disposition WHERE drive_key = ? AND host IS NOT NULL
+               GROUP BY host ORDER BY first_seen`)
+    .all(driveKey);
+  return rows;
 }

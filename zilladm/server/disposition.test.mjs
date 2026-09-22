@@ -8,7 +8,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 
-import { currentStatus, history, roster, setStatus, supportsHardwareFailure } from "./disposition.mjs";
+import { currentStatus, history, hostsSeen, roster, setStatus, supportsHardwareFailure } from "./disposition.mjs";
 
 const db = () => new DatabaseSync(":memory:");
 
@@ -94,4 +94,29 @@ test("the roster shows each drive once, at its latest status", () => {
   const rows = roster(d);
   assert.equal(rows.length, 2);
   assert.deepEqual(rows.map((r) => [r.drive_key, r.status]), [["A", "in_service"], ["B", "quarantined"]]);
+});
+
+test("a drive keeps one history when it moves to another computer", () => {
+  // Operator, 2026-09-22: "some of these drives are going to go back to another computer." The
+  // letter and the disk number do not survive that trip; the serial does, so the ledger does.
+  const d = db();
+  setStatus(d, { driveKey: "ZL28VPHL", to: "suspect", host: "LABZILLA", actor: "claude", reason: "SMART ATTENTION" });
+  setStatus(d, { driveKey: "ZL28VPHL", to: "quarantined", host: "LABZILLA", actor: "operator", reason: "pending move" });
+  setStatus(d, { driveKey: "ZL28VPHL", to: "in_service", host: "OTHER-PC", actor: "operator", reason: "re-tested after the move" });
+  const where = hostsSeen(d, "ZL28VPHL");
+  assert.deepEqual(where.map((w) => w.host), ["LABZILLA", "OTHER-PC"]);
+  assert.equal(where[0].events, 2);
+  assert.equal(currentStatus(d, "ZL28VPHL"), "in_service");
+  assert.equal(roster(d)[0].host, "OTHER-PC", "the roster says where it is now");
+});
+
+test("a ledger written before hosts were recorded still opens", () => {
+  const d = db();
+  d.exec(`CREATE TABLE drive_disposition (id INTEGER PRIMARY KEY, at TEXT NOT NULL, drive_key TEXT NOT NULL,
+          from_status TEXT, to_status TEXT NOT NULL, cause TEXT, actor TEXT NOT NULL, reason TEXT NOT NULL, evidence TEXT)`);
+  d.prepare(`INSERT INTO drive_disposition (at, drive_key, to_status, actor, reason) VALUES (?,?,?,?,?)`)
+    .run("2026-09-21T00:00:00Z", "OLD1", "suspect", "claude", "before the host column existed");
+  setStatus(d, { driveKey: "OLD1", to: "in_service", host: "LABZILLA", actor: "claude", reason: "cleared" });
+  assert.equal(currentStatus(d, "OLD1"), "in_service");
+  assert.deepEqual(hostsSeen(d, "OLD1").map((w) => w.host), ["LABZILLA"]);
 });
