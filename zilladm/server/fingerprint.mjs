@@ -30,6 +30,7 @@
 import { createHash } from "node:crypto";
 import { open as openFile } from "node:fs/promises";
 import * as cat from "./catalogue.mjs";
+import { createHangTracker, withReadTimeout } from "./read-guard.mjs";
 
 const QUICK_BYTES = 64 * 1024;          // each end
 const QUICK_THRESHOLD = QUICK_BYTES * 2; // at or below this, a "quick" hash IS the whole file
@@ -161,8 +162,12 @@ async function fingerprintVolume(vol, onTick) {
   const scanId = cat.startScan(vol.id, "fingerprint");
   const setQuick = d.prepare(`UPDATE files SET quick_hash = ?, sha256 = COALESCE(?, sha256) WHERE id = ?`);
   const setFull = d.prepare(`UPDATE files SET sha256 = ? WHERE id = ?`);
-  const stats = { quick: 0, full: 0, read: 0, errors: 0, retried: 0 };
+  const stats = { quick: 0, full: 0, read: 0, errors: 0, retried: 0, hung: 0 };
   const findings = [];
+  // A read that never returns is a finding about the file; a streak of them is a finding about the
+  // path, and ends the volume. See server/read-guard.mjs.
+  const hangs = createHangTracker();
+  let aborted = null;
 
   const candidates = d.prepare(
     `SELECT id, path, size_bytes FROM files
@@ -174,12 +179,23 @@ async function fingerprintVolume(vol, onTick) {
   for (const f of candidates) {
     const abs = `${vol.drive_letter}\\${f.path}`;
     try {
-      const { value: r, retries } = await withRetry(() => quickHash(abs, f.size_bytes));
+      const { value: r, retries } = await withRetry(() => withReadTimeout(() => quickHash(abs, f.size_bytes), { path: abs }));
       setQuick.run(r.quick, r.full, f.id);
       stats.quick++;
       stats.read += r.read;
       stats.retried += retries ? 1 : 0;
+      hangs.ok();
     } catch (e) {
+      if (e.code === "EREADHUNG") {
+        // 2026-09-21: one read that never returned stopped E: for hours, silently. Now it is a
+        // finding, and a streak of them ends the volume instead of grinding on a dead path.
+        const verdict = hangs.hung(abs);
+        findings.push({ path: f.path, kind: verdict.finding, detail: verdict.reason.slice(0, 200) });
+        stats.errors++;
+        stats.hung = (stats.hung ?? 0) + 1;
+        if (verdict.action === "abort_volume") { aborted = verdict; break; }
+        continue;
+      }
       // R6: a skip is a finding. An unhashable file cannot be proven duplicate, so it BLOCKS
       // its drive from being retired - the correct and conservative outcome. Record the code AND
       // the message: `UNKNOWN` alone told us nothing and cost a diagnostic round trip.
@@ -198,14 +214,24 @@ async function fingerprintVolume(vol, onTick) {
                           GROUP BY quick_hash HAVING COUNT(*) > 1)
      ORDER BY size_bytes`).all(vol.id);
 
-  for (const f of collisions) {
+  for (const f of aborted ? [] : collisions) {
+    const abs = `${vol.drive_letter}\\${f.path}`;
     try {
-      const { value: r, retries } = await withRetry(() => fullHash(`${vol.drive_letter}\\${f.path}`));
+      const { value: r, retries } = await withRetry(() => withReadTimeout(() => fullHash(abs), { path: abs }));
       setFull.run(r.hash, f.id);
       stats.full++;
       stats.read += r.read;
       stats.retried += retries ? 1 : 0;
+      hangs.ok();
     } catch (e) {
+      if (e.code === "EREADHUNG") {
+        const verdict = hangs.hung(abs);
+        findings.push({ path: f.path, kind: verdict.finding, detail: verdict.reason.slice(0, 200) });
+        stats.errors++;
+        stats.hung = (stats.hung ?? 0) + 1;
+        if (verdict.action === "abort_volume") { aborted = verdict; break; }
+        continue;
+      }
       findings.push({ path: f.path, kind: "hash_failed",
                       detail: `${e.code || "?"}: ${String(e.message).slice(0, 160)}` });
       stats.errors++;
@@ -214,7 +240,10 @@ async function fingerprintVolume(vol, onTick) {
   }
 
   if (findings.length) cat.ingestFindings(vol.id, scanId, findings);
-  cat.finishScan(scanId, stats.errors ? "complete_with_findings" : "complete");
+  // An abandoned volume must never read as "complete": it is an unfinished pass on a path that
+  // stopped answering, and the catalogue has to say so or the drive looks fingerprinted.
+  cat.finishScan(scanId, aborted ? "aborted_path_unreadable" : stats.errors ? "complete_with_findings" : "complete");
+  if (aborted) stats.aborted = aborted.reason;
   return stats;
 }
 
